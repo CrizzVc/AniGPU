@@ -1,0 +1,23 @@
+[package]
+name = "anigpu-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "GPU-accelerated desktop anime player (egui + wgpu)"
+
+[[bin]]
+name = "anigpu"
+path = "src/main.rs"
+
+[dependencies]
+anigpu-core = { workspace = true }
+anigpu-mpv = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_extras = { workspace = true }
+image = { workspace = true }
+tokio = { workspace = true }
+directories = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }

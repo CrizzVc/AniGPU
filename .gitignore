@@ -1,0 +1,9 @@
+/target
+node_modules/
+*.dll
+*.exe
+*.7z
+*.log
+backend/*.html
+.vscode/
+.idea/

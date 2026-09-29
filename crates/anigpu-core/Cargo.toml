@@ -1,0 +1,17 @@
+[package]
+name = "anigpu-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Scrapers, providers and shared models for AniGPU"
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+scraper = { workspace = true }
+regex = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+urlencoding = { workspace = true }
+tracing = { workspace = true }
