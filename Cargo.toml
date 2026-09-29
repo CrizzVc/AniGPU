@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 eframe = "0.36"
 egui = "0.36"
-egui_extras = "0.36"
+egui_extras = { version = "0.36", features = ["all_loaders"] }
 image = "0.25"
 libloading = "0.9"
 directories = "6"
