@@ -229,9 +229,11 @@ dependencies = [
  "egui_extras",
  "image",
  "reqwest",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
 ]
 
 [[package]]
