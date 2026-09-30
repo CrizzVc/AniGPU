@@ -1323,6 +1323,15 @@ impl AniGpuApp {
 
         let bg_color = ui.visuals().panel_fill;
 
+        // Descargamos el desenfocado mientras el usuario sigue en Info, para que
+        // al abrir Episodios/Relacionados ya esté listo. Se espera a que TMDB
+        // resuelva (o falle) así no pedimos dos fondos distintos.
+        if self.tmdb_cache.contains_key(&details.title) {
+            if let Some(url) = &backdrop_url {
+                self.request_blurred_backdrop(url, ui.ctx().clone());
+            }
+        }
+
         // ── Render based on current tab ─────────────────────────────────
         match self.detail_tab {
             DetailTab::Info => {
