@@ -1,6 +1,7 @@
-use anigpu_core::models::{AnimeDetails, LatestItem};
+use anigpu_core::models::{AnimeDetails, EpisodeItem, LatestItem};
 use anigpu_core::sources::get_source;
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -57,6 +58,29 @@ enum DetailTab {
     Related,
 }
 
+// ── Progreso de visualización ────────────────────────────────────────────────
+
+/// Episodio empezado y no terminado.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CurrentEpisode {
+    /// Número de episodio (EpisodeNum::as_i64, o índice + 1 como respaldo)
+    ep: i64,
+    /// Posición dentro del episodio: 0.0 ..= 1.0
+    #[serde(default)]
+    position: f32,
+}
+
+/// Historial de un anime: qué capítulos se vieron completos y cuál quedó a medias.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WatchProgress {
+    /// Capítulos vistos por completo
+    #[serde(default)]
+    completed: Vec<i64>,
+    /// Capítulo empezado sin terminar
+    #[serde(default)]
+    current: Option<CurrentEpisode>,
+}
+
 struct AniGpuApp {
     rt: Arc<Runtime>,
     items: Option<Vec<LatestItem>>,
@@ -70,6 +94,9 @@ struct AniGpuApp {
     rx_tmdb: Receiver<(String, String)>,
     tx_tmdb: Sender<(String, String)>,
     tmdb_requested: std::collections::HashSet<String>,
+
+    // Progreso de visualización por anime (watch_progress.json)
+    watch_progress: std::collections::HashMap<String, WatchProgress>,
 
     // Navigation
     screen: Screen,
@@ -117,6 +144,118 @@ impl AniGpuApp {
         }
     }
 
+    // ── Progreso de visualización ────────────────────────────────────────────
+
+    fn watch_progress_path() -> Option<std::path::PathBuf> {
+        directories::ProjectDirs::from("", "", "AniGPU")
+            .map(|dirs| dirs.cache_dir().join("watch_progress.json"))
+    }
+
+    fn load_watch_progress() -> std::collections::HashMap<String, WatchProgress> {
+        if let Some(path) = Self::watch_progress_path() {
+            if path.exists() {
+                if let Ok(data) = std::fs::read_to_string(&path) {
+                    if let Ok(map) = serde_json::from_str::<
+                        std::collections::HashMap<String, WatchProgress>,
+                    >(&data)
+                    {
+                        return map;
+                    }
+                }
+            }
+        }
+        std::collections::HashMap::new()
+    }
+
+    fn save_watch_progress(&self) {
+        if let Some(path) = Self::watch_progress_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string(&self.watch_progress) {
+                let _ = std::fs::write(&path, json);
+            }
+        }
+    }
+
+    /// Clave estable del anime abierto en la vista de detalle.
+    fn anime_key(&self, details: &AnimeDetails) -> String {
+        match &self.screen {
+            Screen::Detail { anime_url, .. } => anime_url.clone(),
+            _ => details.title.clone(),
+        }
+    }
+
+    /// Número de un episodio (o su posición si la fuente no trae número).
+    fn episode_number(ep: &EpisodeItem, idx: usize) -> i64 {
+        ep.episode.as_i64().unwrap_or((idx + 1) as i64)
+    }
+
+    /// El usuario arrancó este episodio: queda "en curso" (no lo marca completado).
+    fn mark_episode_started(&mut self, anime: &str, ep: i64) {
+        let entry = self.watch_progress.entry(anime.to_owned()).or_default();
+        if entry.current.as_ref().map(|c| c.ep) == Some(ep) {
+            return;
+        }
+        entry.current = Some(CurrentEpisode { ep, position: 0.0 });
+        self.save_watch_progress();
+    }
+
+    /// API preparada para el player (fase mpv): marca el capítulo como visto por completo.
+    #[allow(dead_code)]
+    fn mark_episode_completed(&mut self, anime: &str, ep: i64) {
+        let entry = self.watch_progress.entry(anime.to_owned()).or_default();
+        if !entry.completed.contains(&ep) {
+            entry.completed.push(ep);
+            entry.completed.sort_unstable();
+        }
+        if entry.current.as_ref().map(|c| c.ep) == Some(ep) {
+            entry.current = None;
+        }
+        self.save_watch_progress();
+    }
+
+    /// Texto del botón Reproducir + índice del episodio al que lleva:
+    /// - nada visto → "Reproducir - Capítulo 1"
+    /// - capítulo a medias → "Continuar viendo - Capítulo N"
+    /// - N completados → "Reproducir - Capítulo N+1"
+    fn play_button_state(
+        progress: Option<&WatchProgress>,
+        details: &AnimeDetails,
+    ) -> (String, Option<usize>) {
+        let episodes = &details.episodes;
+        if episodes.is_empty() {
+            return ("▶  Reproducir".to_string(), None);
+        }
+
+        let number_at = |idx: usize| Self::episode_number(&episodes[idx], idx);
+        let label_at = |idx: usize, prefix: &str| format!("{}{}", prefix, episodes[idx].episode);
+        let play = "▶  Reproducir - Capítulo ";
+
+        match progress {
+            None => (label_at(0, play), Some(0)),
+            Some(progress) => {
+                // Capítulo empezado y sin terminar
+                if let Some(current) = &progress.current {
+                    if let Some(idx) = (0..episodes.len()).find(|&i| number_at(i) == current.ep) {
+                        return (label_at(idx, "▶  Continuar viendo - Capítulo "), Some(idx));
+                    }
+                }
+
+                // Último capítulo completado + 1 (si ya no existe, el último)
+                if let Some(&last) = progress.completed.iter().max() {
+                    let next = last + 1;
+                    let idx = (0..episodes.len())
+                        .find(|&i| number_at(i) == next)
+                        .unwrap_or(episodes.len() - 1);
+                    return (label_at(idx, play), Some(idx));
+                }
+
+                (label_at(0, play), Some(0))
+            }
+        }
+    }
+
     fn new(rt: Arc<Runtime>) -> Self {
         let (tx, rx) = channel();
         let (tx_tmdb, rx_tmdb) = channel();
@@ -137,6 +276,8 @@ impl AniGpuApp {
             rx_tmdb,
             tx_tmdb,
             tmdb_requested,
+
+            watch_progress: Self::load_watch_progress(),
 
             screen: Screen::Home,
 
@@ -851,12 +992,19 @@ impl AniGpuApp {
         let sub_size = (title_size * 0.42).clamp(13.0, 17.0);
         let btn_font = (title_size * 0.40).clamp(14.0, 18.0);
         let btn_w = (avail_width * 0.14).clamp(150.0, 220.0);
+        let play_w = (avail_width * 0.30).clamp(320.0, 420.0);
+        let eps_w = 310.0;
         let btn_h = (avail_height * 0.06).clamp(38.0, 48.0);
         let max_content_w = (avail_width * 0.52).clamp(380.0, 680.0);
 
         let mut go_back = false;
         let mut go_episodes = false;
         let mut go_related = false;
+
+        // Botón Reproducir según el progreso de visualización del usuario
+        let anime_key = self.anime_key(details);
+        let (play_label, play_index) =
+            Self::play_button_state(self.watch_progress.get(&anime_key), details);
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -880,7 +1028,7 @@ impl AniGpuApp {
                             go_back = true;
                         }
 
-                        ui.add_space(32.0);
+                        ui.add_space(56.0);
 
                         // ── Title ─────────────────────────────────────────────
                         ui.label(
@@ -951,7 +1099,7 @@ impl AniGpuApp {
                         // ── Action Buttons (columna vertical) ─────────────────
                         ui.vertical(|ui| {
                             let play_btn = egui::Button::new(
-                                egui::RichText::new("▶  Reproducir")
+                                egui::RichText::new(&play_label)
                                     .color(egui::Color32::BLACK)
                                     .size(btn_font)
                                     .strong(),
@@ -959,8 +1107,11 @@ impl AniGpuApp {
                             .fill(egui::Color32::WHITE)
                             .corner_radius(8.0);
 
-                            if ui.add_sized([btn_w, btn_h], play_btn).clicked() {
-                                if let Some(ep) = details.episodes.last() {
+                            if ui.add_sized([play_w, btn_h], play_btn).clicked() {
+                                if let Some(idx) = play_index {
+                                    let ep = &details.episodes[idx];
+                                    let number = Self::episode_number(ep, idx);
+                                    self.mark_episode_started(&anime_key, number);
                                     println!("Reproducir: {}", ep.url);
                                 }
                             }
@@ -975,7 +1126,7 @@ impl AniGpuApp {
                             .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
                             .corner_radius(8.0);
 
-                            if ui.add_sized([btn_w, btn_h], ep_btn).clicked() {
+                            if ui.add_sized([eps_w, btn_h], ep_btn).clicked() {
                                 go_episodes = true;
                             }
 
@@ -1047,7 +1198,14 @@ impl AniGpuApp {
         );
         let transparent =
             egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 0);
-        Self::draw_gradient_rect(ui, header_fade, transparent, transparent, bg_color, bg_color);
+        Self::draw_gradient_rect(
+            ui,
+            header_fade,
+            transparent,
+            transparent,
+            bg_color,
+            bg_color,
+        );
 
         // Header content: back + title
         let header_content = egui::Rect::from_min_max(
@@ -1365,7 +1523,7 @@ impl AniGpuApp {
 
                 ui.add_space(12.0);
 
-                for ep in &details.episodes {
+                for (idx, ep) in details.episodes.iter().enumerate() {
                     let ep_num_str = ep.episode.to_string();
                     let row_height = ep_thumb_h + ep_spacing;
 
@@ -1384,6 +1542,9 @@ impl AniGpuApp {
                     }
 
                     if row_resp.clicked() {
+                        let anime_key = self.anime_key(details);
+                        let number = Self::episode_number(ep, idx);
+                        self.mark_episode_started(&anime_key, number);
                         println!("Reproducir episodio {}: {}", ep_num_str, ep.url);
                     }
 
@@ -1912,5 +2073,94 @@ impl eframe::App for AniGpuApp {
                 .layout(egui::Layout::top_down(egui::Align::Center)),
         );
         self.render_sidebar(&mut sidebar_ui);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anigpu_core::models::EpisodeNum;
+
+    fn details_with_episodes(count: u32) -> AnimeDetails {
+        AnimeDetails {
+            title: "Anime de prueba".to_string(),
+            synopsis: String::new(),
+            cover: None,
+            backdrop: None,
+            status: None,
+            genres: Vec::new(),
+            related: Vec::new(),
+            episodes: (1..=count)
+                .map(|n| EpisodeItem {
+                    episode: EpisodeNum::Int(n),
+                    url: format!("https://example.test/ep{}", n),
+                    image: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn progress(completed: &[i64], current: Option<i64>) -> WatchProgress {
+        WatchProgress {
+            completed: completed.to_vec(),
+            current: current.map(|ep| CurrentEpisode { ep, position: 0.0 }),
+        }
+    }
+
+    #[test]
+    fn sin_progreso_reproduce_el_capitulo_1() {
+        let details = details_with_episodes(12);
+        let (label, idx) = AniGpuApp::play_button_state(None, &details);
+        assert_eq!(label, "▶  Reproducir - Capítulo 1");
+        assert_eq!(idx, Some(0));
+    }
+
+    #[test]
+    fn siete_completos_sigue_el_capitulo_8() {
+        let details = details_with_episodes(12);
+        let p = progress(&[1, 2, 3, 4, 5, 6, 7], None);
+        let (label, idx) = AniGpuApp::play_button_state(Some(&p), &details);
+        assert_eq!(label, "▶  Reproducir - Capítulo 8");
+        assert_eq!(idx, Some(7));
+    }
+
+    #[test]
+    fn capitulo_incompleto_pide_continuar() {
+        let details = details_with_episodes(12);
+        let p = progress(&[1, 2, 3, 4, 5, 6], Some(7));
+        let (label, idx) = AniGpuApp::play_button_state(Some(&p), &details);
+        assert_eq!(label, "▶  Continuar viendo - Capítulo 7");
+        assert_eq!(idx, Some(6));
+    }
+
+    #[test]
+    fn ultimo_completado_no_desborda_de_la_lista() {
+        let details = details_with_episodes(3);
+        let p = progress(&[1, 2, 3], None);
+        let (label, idx) = AniGpuApp::play_button_state(Some(&p), &details);
+        assert_eq!(label, "▶  Reproducir - Capítulo 3");
+        assert_eq!(idx, Some(2));
+    }
+
+    #[test]
+    fn sin_episodios_no_propone_nada() {
+        let details = details_with_episodes(0);
+        let (label, idx) = AniGpuApp::play_button_state(None, &details);
+        assert_eq!(label, "▶  Reproducir");
+        assert_eq!(idx, None);
+    }
+
+    #[test]
+    fn episodios_sin_numero_usan_su_posicion() {
+        let mut details = details_with_episodes(0);
+        details.episodes.push(EpisodeItem {
+            episode: EpisodeNum::Str("FINAL".to_string()),
+            url: "https://example.test/final".to_string(),
+            image: None,
+        });
+        let p = progress(&[], Some(1));
+        let (label, idx) = AniGpuApp::play_button_state(Some(&p), &details);
+        assert_eq!(label, "▶  Continuar viendo - Capítulo FINAL");
+        assert_eq!(idx, Some(0));
     }
 }
