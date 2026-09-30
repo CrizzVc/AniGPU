@@ -68,7 +68,7 @@ struct AniGpuApp {
     tmdb_cache: std::collections::HashMap<String, String>,
     rx_tmdb: Receiver<(String, String)>,
     tx_tmdb: Sender<(String, String)>,
-    last_requested_title: String,
+    tmdb_requested: std::collections::HashSet<String>,
 
     // Navigation
     screen: Screen,
@@ -85,10 +85,42 @@ struct AniGpuApp {
 }
 
 impl AniGpuApp {
+    fn cache_file_path() -> Option<std::path::PathBuf> {
+        directories::ProjectDirs::from("", "", "AniGPU").map(|dirs| {
+            dirs.cache_dir().join("tmdb_backdrops.json")
+        })
+    }
+
+    fn load_tmdb_cache() -> std::collections::HashMap<String, String> {
+        if let Some(path) = Self::cache_file_path() {
+            if path.exists() {
+                if let Ok(data) = std::fs::read_to_string(&path) {
+                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&data) {
+                        return map;
+                    }
+                }
+            }
+        }
+        std::collections::HashMap::new()
+    }
+
+    fn save_tmdb_cache(&self) {
+        if let Some(path) = Self::cache_file_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string(&self.tmdb_cache) {
+                let _ = std::fs::write(&path, json);
+            }
+        }
+    }
+
     fn new(rt: Arc<Runtime>) -> Self {
         let (tx, rx) = channel();
         let (tx_tmdb, rx_tmdb) = channel();
         let (tx_detail, rx_detail) = channel();
+        let tmdb_cache = Self::load_tmdb_cache();
+        let tmdb_requested: std::collections::HashSet<String> = tmdb_cache.keys().cloned().collect();
         Self {
             rt,
             items: None,
@@ -98,10 +130,10 @@ impl AniGpuApp {
             tx,
             focused_index: 0,
             selected_tab: 0,
-            tmdb_cache: std::collections::HashMap::new(),
+            tmdb_cache,
             rx_tmdb,
             tx_tmdb,
-            last_requested_title: String::new(),
+            tmdb_requested,
 
             screen: Screen::Home,
 
@@ -136,10 +168,7 @@ impl AniGpuApp {
     }
 
     fn navigate_to_detail(&mut self, item: &LatestItem, ctx: egui::Context) {
-        let anime_url = item
-            .anime_url
-            .clone()
-            .unwrap_or_else(|| item.url.clone());
+        let anime_url = item.anime_url.clone().unwrap_or_else(|| item.url.clone());
 
         self.screen = Screen::Detail {
             anime_url: anime_url.clone(),
@@ -303,7 +332,7 @@ impl AniGpuApp {
                     if let Some(data) = json["data"].as_array() {
                         if let Some(first) = data.first() {
                             let attrs = &first["attributes"];
-                            
+
                             // Obtener títulos alternativos en inglés
                             let mut alt_names = Vec::new();
                             if let Some(en) = attrs["titles"]["en"].as_str() {
@@ -324,11 +353,17 @@ impl AniGpuApp {
                                         urlencoding::encode(alt)
                                     );
                                     if let Ok(t_resp) = reqwest::get(&tmdb_url).await {
-                                        if let Ok(t_json) = t_resp.json::<serde_json::Value>().await {
+                                        if let Ok(t_json) = t_resp.json::<serde_json::Value>().await
+                                        {
                                             if let Some(t_results) = t_json["results"].as_array() {
                                                 for res in t_results {
-                                                    if let Some(path) = res["backdrop_path"].as_str() {
-                                                        return Some(format!("https://image.tmdb.org/t/p/original{}", path));
+                                                    if let Some(path) =
+                                                        res["backdrop_path"].as_str()
+                                                    {
+                                                        return Some(format!(
+                                                            "https://image.tmdb.org/t/p/original{}",
+                                                            path
+                                                        ));
                                                     }
                                                 }
                                             }
@@ -338,8 +373,10 @@ impl AniGpuApp {
                             }
 
                             // Si TMDB aún no tiene backdrop, usar el coverImage oficial de Kitsu (alta resolución)
-                            if let Some(cover_url) = attrs["coverImage"]["original"].as_str()
-                                .or_else(|| attrs["coverImage"]["large"].as_str()) {
+                            if let Some(cover_url) = attrs["coverImage"]["original"]
+                                .as_str()
+                                .or_else(|| attrs["coverImage"]["large"].as_str())
+                            {
                                 return Some(cover_url.to_string());
                             }
                         }
@@ -607,8 +644,55 @@ impl AniGpuApp {
         // Error state
         if let Some(err) = &self.detail_error {
             let err = err.clone();
-            ui.centered_and_justified(|ui| {
-                ui.colored_label(egui::Color32::RED, format!("Error: {}", err));
+            ui.vertical_centered(|ui| {
+                ui.add_space(avail_height * 0.3);
+                ui.label(
+                    egui::RichText::new("⚠  No se pudo cargar")
+                        .color(egui::Color32::from_rgb(255, 120, 120))
+                        .size(22.0)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(&err)
+                        .color(egui::Color32::from_rgb(160, 160, 175))
+                        .size(13.0),
+                );
+                ui.add_space(20.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(avail_width * 0.5 - 140.0);
+                    let back_btn = egui::Button::new(
+                        egui::RichText::new("←  Volver")
+                            .color(egui::Color32::WHITE)
+                            .size(14.0),
+                    )
+                    .fill(egui::Color32::from_rgb(40, 40, 50))
+                    .corner_radius(6.0);
+                    if ui.add_sized([120.0, 36.0], back_btn).clicked() {
+                        self.screen = Screen::Home;
+                    }
+
+                    ui.add_space(8.0);
+
+                    let retry_btn = egui::Button::new(
+                        egui::RichText::new("↻  Reintentar")
+                            .color(egui::Color32::WHITE)
+                            .size(14.0),
+                    )
+                    .fill(egui::Color32::from_rgb(40, 40, 50))
+                    .corner_radius(6.0);
+                    if ui.add_sized([130.0, 36.0], retry_btn).clicked() {
+                        if let Screen::Detail {
+                            ref anime_url,
+                            ref origin_item,
+                        } = self.screen.clone()
+                        {
+                            let item = origin_item.clone();
+                            let ctx = ui.ctx().clone();
+                            self.navigate_to_detail(&item, ctx);
+                        }
+                    }
+                });
             });
             return;
         }
@@ -665,10 +749,24 @@ impl AniGpuApp {
         // ── Render based on current tab ─────────────────────────────────
         match self.detail_tab {
             DetailTab::Info => {
-                self.render_detail_info(ui, &details, &backdrop_url, bg_color, avail_width, avail_height);
+                self.render_detail_info(
+                    ui,
+                    &details,
+                    &backdrop_url,
+                    bg_color,
+                    avail_width,
+                    avail_height,
+                );
             }
             DetailTab::Episodes => {
-                self.render_detail_episodes(ui, &details, &backdrop_url, bg_color, avail_width, avail_height);
+                self.render_detail_episodes(
+                    ui,
+                    &details,
+                    &backdrop_url,
+                    bg_color,
+                    avail_width,
+                    avail_height,
+                );
             }
         }
     }
@@ -687,10 +785,8 @@ impl AniGpuApp {
         let margin_x = (avail_width * 0.04).clamp(28.0, 60.0);
 
         // ── Full-screen backdrop behind everything ────────────────
-        let full_bg_rect = egui::Rect::from_min_size(
-            ui.cursor().min,
-            egui::vec2(avail_width, avail_height),
-        );
+        let full_bg_rect =
+            egui::Rect::from_min_size(ui.cursor().min, egui::vec2(avail_width, avail_height));
         if let Some(url) = backdrop_url {
             let image = egui::Image::new(url).fit_to_exact_size(full_bg_rect.size());
             image.paint_at(ui, full_bg_rect);
@@ -699,22 +795,40 @@ impl AniGpuApp {
         // ── Strong left-side dark gradient (very pronounced) ──────
         let left_vignette_full = egui::Rect::from_min_max(
             full_bg_rect.min,
-            egui::pos2(full_bg_rect.min.x + (avail_width * 0.70), full_bg_rect.max.y),
+            egui::pos2(
+                full_bg_rect.min.x + (avail_width * 0.70),
+                full_bg_rect.max.y,
+            ),
         );
-        let bg_opaque = egui::Color32::from_rgba_unmultiplied(
-            bg_color.r(), bg_color.g(), bg_color.b(), 255,
+        let bg_opaque =
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 255);
+        let bg_transparent =
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 0);
+        Self::draw_gradient_rect(
+            ui,
+            left_vignette_full,
+            bg_opaque,
+            bg_transparent,
+            bg_opaque,
+            bg_transparent,
         );
-        let bg_transparent = egui::Color32::from_rgba_unmultiplied(
-            bg_color.r(), bg_color.g(), bg_color.b(), 0,
-        );
-        Self::draw_gradient_rect(ui, left_vignette_full, bg_opaque, bg_transparent, bg_opaque, bg_transparent);
 
         // ── Bottom fade on the full background ────────────────────
         let bottom_fade_full = egui::Rect::from_min_max(
-            egui::pos2(full_bg_rect.min.x, full_bg_rect.max.y - (avail_height * 0.40)),
+            egui::pos2(
+                full_bg_rect.min.x,
+                full_bg_rect.max.y - (avail_height * 0.40),
+            ),
             full_bg_rect.max,
         );
-        Self::draw_gradient_rect(ui, bottom_fade_full, bg_transparent, bg_transparent, bg_opaque, bg_opaque);
+        Self::draw_gradient_rect(
+            ui,
+            bottom_fade_full,
+            bg_transparent,
+            bg_transparent,
+            bg_opaque,
+            bg_opaque,
+        );
 
         let title_size = (avail_width * 0.030).clamp(26.0, 48.0);
         let sub_size = (title_size * 0.42).clamp(13.0, 17.0);
@@ -940,10 +1054,8 @@ impl AniGpuApp {
         let header_height = (avail_height * 0.22).clamp(120.0, 200.0);
 
         // Allocate the header
-        let (header_rect, _) = ui.allocate_exact_size(
-            egui::vec2(avail_width, header_height),
-            egui::Sense::hover(),
-        );
+        let (header_rect, _) =
+            ui.allocate_exact_size(egui::vec2(avail_width, header_height), egui::Sense::hover());
 
         // Draw mini backdrop
         if let Some(url) = backdrop_url {
@@ -952,9 +1064,8 @@ impl AniGpuApp {
         }
 
         // Dark overlay on the header
-        let overlay_color = egui::Color32::from_rgba_unmultiplied(
-            bg_color.r(), bg_color.g(), bg_color.b(), 200,
-        );
+        let overlay_color =
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 200);
         ui.painter().rect_filled(header_rect, 0.0, overlay_color);
 
         // Bottom fade on header
@@ -962,10 +1073,16 @@ impl AniGpuApp {
             egui::pos2(header_rect.min.x, header_rect.max.y - 40.0),
             header_rect.max,
         );
-        let transparent = egui::Color32::from_rgba_unmultiplied(
-            bg_color.r(), bg_color.g(), bg_color.b(), 0,
+        let transparent =
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 0);
+        Self::draw_gradient_rect(
+            ui,
+            header_fade,
+            transparent,
+            transparent,
+            bg_color,
+            bg_color,
         );
-        Self::draw_gradient_rect(ui, header_fade, transparent, transparent, bg_color, bg_color);
 
         // Header content: title + back
         let header_content = egui::Rect::from_min_max(
@@ -1021,11 +1138,8 @@ impl AniGpuApp {
         );
 
         // Left panel background
-        ui.painter().rect_filled(
-            left_rect,
-            0.0,
-            egui::Color32::from_rgb(10, 10, 14),
-        );
+        ui.painter()
+            .rect_filled(left_rect, 0.0, egui::Color32::from_rgb(10, 10, 14));
 
         // Left panel content
         let left_content = egui::Rect::from_min_max(
@@ -1226,8 +1340,8 @@ impl AniGpuApp {
         let avail_width = ui.available_width();
         let avail_height = ui.available_height();
 
-        // Altura dinámica del hero más alta para lucir el arte (aprox 64% de la altura disponible)
-        let hero_height = (avail_height * 0.64).clamp(360.0, 750.0);
+        // El banner ocupa TODA la altura disponible
+        let hero_height = avail_height;
         let margin_x = (avail_width * 0.035).clamp(24.0, 52.0);
 
         // Tamaños de fuente responsivos
@@ -1235,272 +1349,285 @@ impl AniGpuApp {
         let subtitle_size = (title_size * 0.42).clamp(13.0, 16.0);
         let btn_font_size = (title_size * 0.44).clamp(14.0, 18.0);
         let btn_width = (avail_width * 0.14).clamp(160.0, 220.0);
-        let btn_height = (hero_height * 0.09).clamp(38.0, 48.0);
+        let btn_height = (hero_height * 0.06).clamp(38.0, 48.0);
 
         // Dimensiones dinámicas de las tarjetas del carrusel (16:9)
-        let card_height = (avail_height * 0.19).clamp(110.0, 175.0);
+        let card_height = (avail_height * 0.17).clamp(100.0, 160.0);
         let card_width = card_height * (16.0 / 9.0);
         let card_spacing = (avail_width * 0.012).clamp(12.0, 22.0);
 
         // Deferred navigation: collect intent inside closures, execute after
         let mut nav_target: Option<LatestItem> = None;
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                // --- Hero Section ---
-                let (rect, _response) = ui.allocate_exact_size(
-                    egui::vec2(avail_width, hero_height),
-                    egui::Sense::hover(),
+        // Allocate full area for hero (no scroll – everything is overlaid)
+        let (rect, _response) =
+            ui.allocate_exact_size(egui::vec2(avail_width, hero_height), egui::Sense::hover());
+
+        // Fetch TMDB backdrop si no lo tenemos aún
+        let mut display_url = hero.image.clone();
+        if let Some(cached_url) = self.tmdb_cache.get(&hero.title) {
+            if !cached_url.is_empty() {
+                display_url = Some(cached_url.clone());
+            }
+        } else if !self.tmdb_requested.contains(&hero.title) {
+            self.tmdb_requested.insert(hero.title.clone());
+            let title = hero.title.clone();
+            let tx_tmdb = self.tx_tmdb.clone();
+            let ctx = ui.ctx().clone();
+
+            self.rt.spawn(async move {
+                let found = Self::fetch_tmdb_backdrop(&title).await;
+                if let Some(u) = found {
+                    let _ = tx_tmdb.send((title, u));
+                    ctx.request_repaint();
+                } else {
+                    let _ = tx_tmdb.send((title, "".to_string()));
+                }
+            });
+        }
+
+        // Fondo Hero – ocupa todo el viewport
+        if let Some(img_url) = &display_url {
+            let image = egui::Image::new(img_url).fit_to_exact_size(rect.size());
+            image.paint_at(ui, rect);
+        }
+
+        let bg_color = ui.visuals().panel_fill;
+
+        // 1. Viñeta lateral izquierda oscura
+        let left_vignette_rect = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.min.x + (avail_width * 0.65), rect.max.y),
+        );
+        let left_color =
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 240);
+        let transparent_bg =
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 0);
+        Self::draw_gradient_rect(
+            ui,
+            left_vignette_rect,
+            left_color,
+            transparent_bg,
+            left_color,
+            transparent_bg,
+        );
+
+        // 2. Degradado inferior MUY OSCURO – cubre el ~55% inferior del banner
+        //    para que el row de capítulos se vea bien
+        let bottom_fade_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x, rect.min.y + (hero_height * 0.55)),
+            rect.max,
+        );
+        let bg_opaque =
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 255);
+        Self::draw_gradient_rect(
+            ui,
+            bottom_fade_rect,
+            transparent_bg,
+            transparent_bg,
+            bg_opaque,
+            bg_opaque,
+        );
+
+        // === Contenido Hero (Episodio -> Título -> Botones) ===
+        // Posicionar en la zona media-inferior, por encima del carrusel
+        let carousel_zone_height = card_height + 55.0 + 50.0; // carrusel + label + espacios
+        let hero_content_height = subtitle_size + title_size + btn_height * 2.0 + 60.0;
+        let hero_content_y = rect.max.y - carousel_zone_height - hero_content_height - 10.0;
+        let hero_content_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + margin_x, hero_content_y),
+            egui::pos2(
+                rect.max.x - margin_x,
+                rect.max.y - carousel_zone_height - 10.0,
+            ),
+        );
+
+        let mut ui_hero = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(hero_content_rect)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+
+        // Episodio formateado limpiamente
+        let ep_raw = hero.episode.as_deref().unwrap_or("1");
+        let ep_label = if ep_raw.to_lowercase().contains("episodio") {
+            ep_raw.to_uppercase()
+        } else {
+            format!("EPISODIO {}", ep_raw)
+        };
+
+        ui_hero.label(
+            egui::RichText::new(ep_label)
+                .color(egui::Color32::from_rgb(200, 200, 220))
+                .size(subtitle_size)
+                .strong(),
+        );
+
+        ui_hero.add_space(6.0);
+
+        // Título del anime
+        ui_hero.label(
+            egui::RichText::new(&hero.title)
+                .color(egui::Color32::WHITE)
+                .size(title_size)
+                .strong(),
+        );
+
+        ui_hero.add_space(14.0);
+
+        // Botón Reproducir
+        let btn = egui::Button::new(
+            egui::RichText::new("▶  Reproducir")
+                .color(egui::Color32::BLACK)
+                .size(btn_font_size)
+                .strong(),
+        )
+        .fill(egui::Color32::WHITE)
+        .corner_radius(8.0);
+
+        if ui_hero.add_sized([btn_width, btn_height], btn).clicked() {
+            println!("Reproducir: {}", hero.url);
+        }
+
+        // Botón Ver Detalles
+        ui_hero.add_space(8.0);
+        let detail_btn = egui::Button::new(
+            egui::RichText::new("ℹ  Ver detalles")
+                .color(egui::Color32::WHITE)
+                .size(btn_font_size * 0.9),
+        )
+        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
+        .corner_radius(8.0);
+
+        if ui_hero
+            .add_sized([btn_width, btn_height * 0.85], detail_btn)
+            .clicked()
+        {
+            nav_target = Some(hero.clone());
+        }
+
+        // === Carrusel de capítulos superpuesto en la parte inferior del banner ===
+        let carousel_top = rect.max.y - carousel_zone_height + 5.0;
+
+        // Label "Últimos Episodios"
+        let label_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x + margin_x, carousel_top),
+            egui::vec2(avail_width - margin_x * 2.0, 28.0),
+        );
+        let mut label_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(label_rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        label_ui.label(
+            egui::RichText::new("Últimos Episodios")
+                .color(egui::Color32::WHITE)
+                .size((title_size * 0.55).clamp(17.0, 24.0))
+                .strong(),
+        );
+
+        // Animación suave de deslizamiento
+        let focus_x_offset = margin_x;
+        let animated_idx = ui.ctx().animate_value_with_time(
+            ui.id().with("focus_anim"),
+            self.focused_index as f32,
+            0.22,
+        );
+
+        if (animated_idx - self.focused_index as f32).abs() > 0.001 {
+            ui.ctx().request_repaint();
+        }
+
+        let strip_top = carousel_top + 36.0;
+        let strip_height = card_height + 55.0;
+        let strip_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.min.x, strip_top),
+            egui::vec2(avail_width, strip_height),
+        );
+
+        for (idx, item) in items.iter().enumerate() {
+            let card_x = strip_rect.min.x
+                + focus_x_offset
+                + ((idx as f32 - animated_idx) * (card_width + card_spacing));
+            let is_focused = idx == self.focused_index;
+
+            // Culling: saltar si está fuera de pantalla
+            if card_x + card_width < strip_rect.min.x || card_x > strip_rect.max.x {
+                continue;
+            }
+
+            // Cuadro de la tarjeta
+            let card_rect = egui::Rect::from_min_size(
+                egui::pos2(card_x, strip_rect.min.y + 4.0),
+                egui::vec2(card_width, card_height),
+            );
+
+            let response = ui.interact(
+                card_rect,
+                ui.id().with("card").with(idx),
+                egui::Sense::click(),
+            );
+
+            if response.clicked() {
+                self.focused_index = idx;
+            }
+
+            if response.double_clicked() {
+                nav_target = Some(item.clone());
+            }
+
+            if let Some(img_url) = &item.image {
+                let image = egui::Image::new(img_url)
+                    .fit_to_exact_size(card_rect.size())
+                    .corner_radius(8.0);
+                image.paint_at(ui, card_rect);
+            }
+
+            if is_focused {
+                ui.painter().rect_stroke(
+                    card_rect,
+                    8.0,
+                    egui::Stroke::new(3.5, egui::Color32::WHITE),
+                    egui::StrokeKind::Outside,
                 );
+            } else if response.hovered() {
+                ui.painter().rect_stroke(
+                    card_rect,
+                    8.0,
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(180, 180, 190)),
+                    egui::StrokeKind::Outside,
+                );
+            }
 
-                    // Fetch TMDB backdrop si no lo tenemos aún
-                    let mut display_url = hero.image.clone();
-                    if let Some(cached_url) = self.tmdb_cache.get(&hero.title) {
-                        if !cached_url.is_empty() {
-                            display_url = Some(cached_url.clone());
-                        }
-                    } else if self.last_requested_title != hero.title {
-                        self.last_requested_title = hero.title.clone();
-                        let title = hero.title.clone();
-                        let tx_tmdb = self.tx_tmdb.clone();
-                        let ctx = ui.ctx().clone();
-
-                        self.rt.spawn(async move {
-                            let found = Self::fetch_tmdb_backdrop(&title).await;
-                            if let Some(u) = found {
-                                let _ = tx_tmdb.send((title, u));
-                                ctx.request_repaint();
-                            } else {
-                                let _ = tx_tmdb.send((title, "".to_string()));
-                            }
-                        });
-                    }
-
-                    // Fondo Hero (ocupa todo el alto y ancho del contenedor rect)
-                    if let Some(img_url) = &display_url {
-                        let image = egui::Image::new(img_url).fit_to_exact_size(rect.size());
-                        image.paint_at(ui, rect);
-                    }
-
-                    let bg_color = ui.visuals().panel_fill;
-
-                    // 1. Viñeta lateral izquierda con el color exacto del fondo
-                    let left_vignette_rect = egui::Rect::from_min_max(
-                        rect.min,
-                        egui::pos2(rect.min.x + (avail_width * 0.65), rect.max.y),
-                    );
-                    let left_color = egui::Color32::from_rgba_unmultiplied(
-                        bg_color.r(),
-                        bg_color.g(),
-                        bg_color.b(),
-                        230,
-                    );
-                    let transparent_bg = egui::Color32::from_rgba_unmultiplied(
-                        bg_color.r(),
-                        bg_color.g(),
-                        bg_color.b(),
-                        0,
-                    );
-                    Self::draw_gradient_rect(ui, left_vignette_rect, left_color, transparent_bg, left_color, transparent_bg);
-
-                    // 2. Gradiente inferior suave (difuminado hacia la base del contenedor)
-                    let bottom_fade_rect = egui::Rect::from_min_max(
-                        egui::pos2(rect.min.x, rect.min.y + (hero_height * 0.50)),
-                        rect.max,
-                    );
-                    Self::draw_gradient_rect(ui, bottom_fade_rect, transparent_bg, transparent_bg, bg_color, bg_color);
-
-                    // --- Contenido Hero (Episodio -> Título -> Botón Reproducir en orden Top-Down) ---
-                    let hero_content_height = subtitle_size + title_size + btn_height + 40.0;
-                    let hero_content_y = rect.max.y - hero_content_height - 20.0;
-                    let hero_content_rect = egui::Rect::from_min_max(
-                        egui::pos2(rect.min.x + margin_x, hero_content_y),
-                        egui::pos2(rect.max.x - margin_x, rect.max.y - 15.0),
-                    );
-
-                    let mut ui_hero = ui.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(hero_content_rect)
-                            .layout(egui::Layout::top_down(egui::Align::LEFT)),
-                    );
-
-                    // Episodio formateado limpiamente
-                    let ep_raw = hero.episode.as_deref().unwrap_or("1");
-                    let ep_label = if ep_raw.to_lowercase().contains("episodio") {
-                        ep_raw.to_uppercase()
+            // Texto debajo de la tarjeta
+            let text_rect = egui::Rect::from_min_size(
+                egui::pos2(card_x, card_rect.max.y + 8.0),
+                egui::vec2(card_width, 42.0),
+            );
+            let mut text_ui = ui.new_child(egui::UiBuilder::new().max_rect(text_rect));
+            text_ui.label(
+                egui::RichText::new(&item.title)
+                    .color(if is_focused {
+                        egui::Color32::WHITE
                     } else {
-                        format!("EPISODIO {}", ep_raw)
-                    };
-
-                    ui_hero.label(
-                        egui::RichText::new(ep_label)
-                            .color(egui::Color32::from_rgb(200, 200, 220))
-                            .size(subtitle_size)
-                            .strong(),
-                    );
-
-                    ui_hero.add_space(6.0);
-
-                    // Título del anime
-                    ui_hero.label(
-                        egui::RichText::new(&hero.title)
-                            .color(egui::Color32::WHITE)
-                            .size(title_size)
-                            .strong(),
-                    );
-
-                    ui_hero.add_space(14.0);
-
-                    // Botón Reproducir
-                    let btn = egui::Button::new(
-                        egui::RichText::new("▶  Reproducir")
-                            .color(egui::Color32::BLACK)
-                            .size(btn_font_size)
-                            .strong(),
-                    )
-                    .fill(egui::Color32::WHITE)
-                    .corner_radius(8.0);
-
-                    if ui_hero.add_sized([btn_width, btn_height], btn).clicked() {
-                        println!("Reproducir: {}", hero.url);
-                    }
-
-                    // Botón Ver Detalles
-                    ui_hero.add_space(8.0);
-                    let detail_btn = egui::Button::new(
-                        egui::RichText::new("ℹ  Ver detalles")
-                            .color(egui::Color32::WHITE)
-                            .size(btn_font_size * 0.9),
-                    )
-                    .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
-                    .corner_radius(8.0);
-
-                    if ui_hero
-                        .add_sized([btn_width, btn_height * 0.85], detail_btn)
-                        .clicked()
-                    {
-                        nav_target = Some(hero.clone());
-                    }
-
-                    ui.add_space((avail_height * 0.025).clamp(12.0, 24.0));
-
-                    // --- Sección Lista Horizontal / Carrusel ---
-                    ui.horizontal(|ui| {
-                        ui.add_space(margin_x);
-                        ui.label(
-                            egui::RichText::new("Últimos Episodios")
-                                .color(egui::Color32::WHITE)
-                                .size((title_size * 0.55).clamp(17.0, 24.0))
-                                .strong(),
-                        );
-                    });
-
-                    ui.add_space((avail_height * 0.015).clamp(8.0, 16.0));
-
-                    let focus_x_offset = margin_x;
-
-                    // Animación suave de deslizamiento
-                    let animated_idx = ui.ctx().animate_value_with_time(
-                        ui.id().with("focus_anim"),
-                        self.focused_index as f32,
-                        0.22,
-                    );
-
-                    if (animated_idx - self.focused_index as f32).abs() > 0.001 {
-                        ui.ctx().request_repaint();
-                    }
-
-                    let strip_height = card_height + 55.0;
-                    let (strip_rect, _resp) = ui.allocate_exact_size(
-                        egui::vec2(avail_width, strip_height),
-                        egui::Sense::hover(),
-                    );
-
-                    for (idx, item) in items.iter().enumerate() {
-                        let card_x = strip_rect.min.x
-                            + focus_x_offset
-                            + ((idx as f32 - animated_idx) * (card_width + card_spacing));
-                        let is_focused = idx == self.focused_index;
-
-                        // Culling: saltar si está fuera de pantalla
-                        if card_x + card_width < strip_rect.min.x || card_x > strip_rect.max.x {
-                            continue;
-                        }
-
-                        // Cuadro de la tarjeta
-                        let card_rect = egui::Rect::from_min_size(
-                            egui::pos2(card_x, strip_rect.min.y + 4.0),
-                            egui::vec2(card_width, card_height),
-                        );
-
-                        let response = ui.interact(
-                            card_rect,
-                            ui.id().with("card").with(idx),
-                            egui::Sense::click(),
-                        );
-
-                        if response.clicked() {
-                            self.focused_index = idx;
-                        }
-
-                        if response.double_clicked() {
-                            nav_target = Some(item.clone());
-                        }
-
-                        if let Some(img_url) = &item.image {
-                            let image = egui::Image::new(img_url)
-                                .fit_to_exact_size(card_rect.size())
-                                .corner_radius(8.0);
-                            image.paint_at(ui, card_rect);
-                        }
-
-                        if is_focused {
-                            ui.painter().rect_stroke(
-                                card_rect,
-                                8.0,
-                                egui::Stroke::new(3.5, egui::Color32::WHITE),
-                                egui::StrokeKind::Outside,
-                            );
-                        } else if response.hovered() {
-                            ui.painter().rect_stroke(
-                                card_rect,
-                                8.0,
-                                egui::Stroke::new(2.0, egui::Color32::from_rgb(180, 180, 190)),
-                                egui::StrokeKind::Outside,
-                            );
-                        }
-
-                        // Texto debajo de la tarjeta
-                        let text_rect = egui::Rect::from_min_size(
-                            egui::pos2(card_x, card_rect.max.y + 8.0),
-                            egui::vec2(card_width, 42.0),
-                        );
-                        let mut text_ui = ui.new_child(egui::UiBuilder::new().max_rect(text_rect));
-                        text_ui.label(
-                            egui::RichText::new(&item.title)
-                                .color(if is_focused {
-                                    egui::Color32::WHITE
-                                } else {
-                                    egui::Color32::from_rgb(160, 160, 170)
-                                })
-                                .size((subtitle_size * 0.95).clamp(12.0, 15.0))
-                                .strong(),
-                        );
-                        text_ui.label(
-                            egui::RichText::new(format!(
-                                "Episodio {}",
-                                item.episode.as_deref().unwrap_or("1")
-                            ))
-                            .color(if is_focused {
-                                egui::Color32::LIGHT_GRAY
-                            } else {
-                                egui::Color32::DARK_GRAY
-                            })
-                            .size((subtitle_size * 0.85).clamp(11.0, 13.0)),
-                        );
-                    }
-                });
+                        egui::Color32::from_rgb(160, 160, 170)
+                    })
+                    .size((subtitle_size * 0.95).clamp(12.0, 15.0))
+                    .strong(),
+            );
+            text_ui.label(
+                egui::RichText::new(format!(
+                    "Episodio {}",
+                    item.episode.as_deref().unwrap_or("1")
+                ))
+                .color(if is_focused {
+                    egui::Color32::LIGHT_GRAY
+                } else {
+                    egui::Color32::DARK_GRAY
+                })
+                .size((subtitle_size * 0.85).clamp(11.0, 13.0)),
+            );
+        }
 
         // Execute deferred navigation after closures
         if let Some(item) = nav_target {
@@ -1562,8 +1689,13 @@ impl eframe::App for AniGpuApp {
         }
 
         // Procesar nuevos fondos de TMDB
+        let mut tmdb_changed = false;
         while let Ok((title, url)) = self.rx_tmdb.try_recv() {
             self.tmdb_cache.insert(title, url);
+            tmdb_changed = true;
+        }
+        if tmdb_changed {
+            self.save_tmdb_cache();
         }
 
         let sidebar_width = 58.0;
