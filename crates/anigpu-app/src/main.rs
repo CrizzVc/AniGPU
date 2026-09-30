@@ -683,172 +683,178 @@ impl AniGpuApp {
         avail_width: f32,
         avail_height: f32,
     ) {
-        let hero_height = (avail_height * 0.72).clamp(380.0, 800.0);
+        let hero_height = avail_height;
         let margin_x = (avail_width * 0.04).clamp(28.0, 60.0);
+
+        // ── Full-screen backdrop behind everything ────────────────
+        let full_bg_rect = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(avail_width, avail_height),
+        );
+        if let Some(url) = backdrop_url {
+            let image = egui::Image::new(url).fit_to_exact_size(full_bg_rect.size());
+            image.paint_at(ui, full_bg_rect);
+        }
+
+        // ── Strong left-side dark gradient (very pronounced) ──────
+        let left_vignette_full = egui::Rect::from_min_max(
+            full_bg_rect.min,
+            egui::pos2(full_bg_rect.min.x + (avail_width * 0.70), full_bg_rect.max.y),
+        );
+        let bg_opaque = egui::Color32::from_rgba_unmultiplied(
+            bg_color.r(), bg_color.g(), bg_color.b(), 255,
+        );
+        let bg_transparent = egui::Color32::from_rgba_unmultiplied(
+            bg_color.r(), bg_color.g(), bg_color.b(), 0,
+        );
+        Self::draw_gradient_rect(ui, left_vignette_full, bg_opaque, bg_transparent, bg_opaque, bg_transparent);
+
+        // ── Bottom fade on the full background ────────────────────
+        let bottom_fade_full = egui::Rect::from_min_max(
+            egui::pos2(full_bg_rect.min.x, full_bg_rect.max.y - (avail_height * 0.40)),
+            full_bg_rect.max,
+        );
+        Self::draw_gradient_rect(ui, bottom_fade_full, bg_transparent, bg_transparent, bg_opaque, bg_opaque);
+
+        let title_size = (avail_width * 0.030).clamp(26.0, 48.0);
+        let sub_size = (title_size * 0.42).clamp(13.0, 17.0);
+        let btn_font = (title_size * 0.40).clamp(14.0, 18.0);
+        let btn_w = (avail_width * 0.14).clamp(150.0, 220.0);
+        let btn_h = (avail_height * 0.06).clamp(38.0, 48.0);
+        let max_content_w = (avail_width * 0.52).clamp(380.0, 680.0);
+
+        let mut go_back = false;
+        let mut go_episodes = false;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // ── Hero backdrop ──────────────────────────────────────
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(avail_width, hero_height),
-                    egui::Sense::hover(),
-                );
+                ui.add_space((avail_height * 0.04).clamp(24.0, 44.0));
 
-                if let Some(url) = backdrop_url {
-                    let image = egui::Image::new(url).fit_to_exact_size(rect.size());
-                    image.paint_at(ui, rect);
-                }
+                ui.horizontal(|ui| {
+                    ui.add_space(margin_x);
+                    ui.vertical(|ui| {
+                        ui.set_max_width(max_content_w);
 
-                // ── Left vignette ─────────────────────────────────────
-                let left_vignette = egui::Rect::from_min_max(
-                    rect.min,
-                    egui::pos2(rect.min.x + (avail_width * 0.65), rect.max.y),
-                );
-                let left_color = egui::Color32::from_rgba_unmultiplied(
-                    bg_color.r(), bg_color.g(), bg_color.b(), 235,
-                );
-                let transparent = egui::Color32::from_rgba_unmultiplied(
-                    bg_color.r(), bg_color.g(), bg_color.b(), 0,
-                );
-                Self::draw_gradient_rect(ui, left_vignette, left_color, transparent, left_color, transparent);
+                        // ── Back button ───────────────────────────────────────
+                        let back_btn = egui::Button::new(
+                            egui::RichText::new("←  Volver")
+                                .color(egui::Color32::from_rgb(210, 210, 230))
+                                .size(sub_size),
+                        )
+                        .fill(egui::Color32::TRANSPARENT);
 
-                // ── Bottom fade ───────────────────────────────────────
-                let bottom_fade = egui::Rect::from_min_max(
-                    egui::pos2(rect.min.x, rect.min.y + hero_height * 0.45),
-                    rect.max,
-                );
-                Self::draw_gradient_rect(ui, bottom_fade, transparent, transparent, bg_color, bg_color);
+                        if ui.add(back_btn).clicked() {
+                            go_back = true;
+                        }
 
-                // ── Content overlay ───────────────────────────────────
-                let title_size = (avail_width * 0.030).clamp(26.0, 48.0);
-                let sub_size = (title_size * 0.42).clamp(13.0, 17.0);
-                let btn_font = (title_size * 0.40).clamp(14.0, 18.0);
-                let btn_w = (avail_width * 0.14).clamp(160.0, 240.0);
-                let btn_h = (hero_height * 0.075).clamp(38.0, 52.0);
+                        ui.add_space(14.0);
 
-                let content_h = title_size + sub_size * 5.0 + btn_h + 160.0;
-                let content_y = rect.max.y - content_h - 24.0;
-                let content_rect = egui::Rect::from_min_max(
-                    egui::pos2(rect.min.x + margin_x, content_y),
-                    egui::pos2(rect.min.x + avail_width * 0.55, rect.max.y - 10.0),
-                );
+                        // ── Title ─────────────────────────────────────────────
+                        ui.label(
+                            egui::RichText::new(&details.title)
+                                .color(egui::Color32::WHITE)
+                                .size(title_size)
+                                .strong(),
+                        );
 
-                let mut hero_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(content_rect)
-                        .layout(egui::Layout::top_down(egui::Align::LEFT)),
-                );
+                        ui.add_space(10.0);
 
-                // ── Back button ───────────────────────────────────────
-                let back_btn = egui::Button::new(
-                    egui::RichText::new("←  Volver")
-                        .color(egui::Color32::WHITE)
-                        .size(sub_size),
-                )
-                .fill(egui::Color32::TRANSPARENT);
+                        // ── Meta badges (status, genres) ──────────────────────
+                        ui.horizontal_wrapped(|ui| {
+                            if let Some(status) = &details.status {
+                                let badge_text = egui::RichText::new(status)
+                                    .color(egui::Color32::WHITE)
+                                    .size(sub_size * 0.9)
+                                    .strong();
+                                let badge = egui::Button::new(badge_text)
+                                    .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18))
+                                    .corner_radius(4.0);
+                                ui.add(badge);
+                                ui.add_space(6.0);
+                            }
 
-                if hero_ui.add(back_btn).clicked() {
+                            let ep_count = details.episodes.len();
+                            if ep_count > 0 {
+                                ui.label(
+                                    egui::RichText::new(format!("{} episodios", ep_count))
+                                        .color(egui::Color32::from_rgb(180, 180, 195))
+                                        .size(sub_size * 0.9),
+                                );
+                                ui.add_space(8.0);
+                            }
+
+                            for genre in details.genres.iter().take(4) {
+                                ui.label(
+                                    egui::RichText::new(genre)
+                                        .color(egui::Color32::from_rgb(150, 150, 170))
+                                        .size(sub_size * 0.85),
+                                );
+                                ui.label(
+                                    egui::RichText::new("·")
+                                        .color(egui::Color32::from_rgb(80, 80, 95))
+                                        .size(sub_size * 0.85),
+                                );
+                            }
+                        });
+
+                        ui.add_space(14.0);
+
+                        // ── Synopsis ──────────────────────────────────────────
+                        if !details.synopsis.is_empty() {
+                            let max_chars = 340;
+                            let synopsis_text = if details.synopsis.len() > max_chars {
+                                format!("{}…", &details.synopsis[..max_chars])
+                            } else {
+                                details.synopsis.clone()
+                            };
+                            ui.label(
+                                egui::RichText::new(synopsis_text)
+                                    .color(egui::Color32::from_rgb(190, 190, 205))
+                                    .size(sub_size),
+                            );
+                            ui.add_space(18.0);
+                        }
+
+                        // ── Action Buttons ────────────────────────────────────
+                        ui.horizontal(|ui| {
+                            let play_btn = egui::Button::new(
+                                egui::RichText::new("▶  Reproducir")
+                                    .color(egui::Color32::BLACK)
+                                    .size(btn_font)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::WHITE)
+                            .corner_radius(8.0);
+
+                            if ui.add_sized([btn_w, btn_h], play_btn).clicked() {
+                                if let Some(ep) = details.episodes.last() {
+                                    println!("Reproducir: {}", ep.url);
+                                }
+                            }
+
+                            ui.add_space(10.0);
+
+                            let ep_btn = egui::Button::new(
+                                egui::RichText::new("📋  Más episodios")
+                                    .color(egui::Color32::WHITE)
+                                    .size(btn_font * 0.9),
+                            )
+                            .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
+                            .corner_radius(8.0);
+
+                            if ui.add_sized([btn_w, btn_h], ep_btn).clicked() {
+                                go_episodes = true;
+                            }
+                        });
+                    });
+                });
+
+                if go_back {
                     self.screen = Screen::Home;
                     return;
                 }
-
-                hero_ui.add_space(12.0);
-
-                // ── Title ─────────────────────────────────────────────
-                hero_ui.label(
-                    egui::RichText::new(&details.title)
-                        .color(egui::Color32::WHITE)
-                        .size(title_size)
-                        .strong(),
-                );
-
-                hero_ui.add_space(8.0);
-
-                // ── Meta badges (status, genres) ──────────────────────
-                hero_ui.horizontal_wrapped(|ui| {
-                    if let Some(status) = &details.status {
-                        let badge_text = egui::RichText::new(status)
-                            .color(egui::Color32::WHITE)
-                            .size(sub_size * 0.9)
-                            .strong();
-                        let badge = egui::Button::new(badge_text)
-                            .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18))
-                            .corner_radius(4.0);
-                        ui.add(badge);
-                        ui.add_space(4.0);
-                    }
-
-                    let ep_count = details.episodes.len();
-                    if ep_count > 0 {
-                        ui.label(
-                            egui::RichText::new(format!("{} episodios", ep_count))
-                                .color(egui::Color32::from_rgb(180, 180, 195))
-                                .size(sub_size * 0.9),
-                        );
-                        ui.add_space(8.0);
-                    }
-
-                    for genre in details.genres.iter().take(4) {
-                        ui.label(
-                            egui::RichText::new(genre)
-                                .color(egui::Color32::from_rgb(150, 150, 170))
-                                .size(sub_size * 0.85),
-                        );
-                        ui.label(
-                            egui::RichText::new("·")
-                                .color(egui::Color32::from_rgb(80, 80, 95))
-                                .size(sub_size * 0.85),
-                        );
-                    }
-                });
-
-                hero_ui.add_space(12.0);
-
-                // ── Synopsis ──────────────────────────────────────────
-                if !details.synopsis.is_empty() {
-                    let max_chars = 280;
-                    let synopsis_text = if details.synopsis.len() > max_chars {
-                        format!("{}…", &details.synopsis[..max_chars])
-                    } else {
-                        details.synopsis.clone()
-                    };
-                    hero_ui.label(
-                        egui::RichText::new(synopsis_text)
-                            .color(egui::Color32::from_rgb(190, 190, 205))
-                            .size(sub_size),
-                    );
-                    hero_ui.add_space(16.0);
-                }
-
-                // ── Play button ───────────────────────────────────────
-                let play_btn = egui::Button::new(
-                    egui::RichText::new("▶  Reproducir")
-                        .color(egui::Color32::BLACK)
-                        .size(btn_font)
-                        .strong(),
-                )
-                .fill(egui::Color32::WHITE)
-                .corner_radius(8.0);
-
-                if hero_ui.add_sized([btn_w, btn_h], play_btn).clicked() {
-                    if let Some(ep) = details.episodes.last() {
-                        println!("Reproducir: {}", ep.url);
-                    }
-                }
-
-                hero_ui.add_space(10.0);
-
-                // ── Episodes button ───────────────────────────────────
-                let ep_btn = egui::Button::new(
-                    egui::RichText::new("📋  Más episodios")
-                        .color(egui::Color32::WHITE)
-                        .size(btn_font * 0.9),
-                )
-                .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
-                .corner_radius(8.0);
-
-                if hero_ui.add_sized([btn_w, btn_h * 0.88], ep_btn).clicked() {
+                if go_episodes {
                     self.detail_tab = DetailTab::Episodes;
                 }
 
