@@ -54,6 +54,7 @@ enum Screen {
 enum DetailTab {
     Info,
     Episodes,
+    Related,
 }
 
 struct AniGpuApp {
@@ -621,7 +622,11 @@ impl AniGpuApp {
 
         // Back button / Escape key
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.screen = Screen::Home;
+            if self.detail_tab == DetailTab::Info {
+                self.screen = Screen::Home;
+            } else {
+                self.detail_tab = DetailTab::Info;
+            }
             return;
         }
 
@@ -770,6 +775,16 @@ impl AniGpuApp {
                     avail_height,
                 );
             }
+            DetailTab::Related => {
+                self.render_detail_related(
+                    ui,
+                    &details,
+                    &backdrop_url,
+                    bg_color,
+                    avail_width,
+                    avail_height,
+                );
+            }
         }
     }
 
@@ -841,6 +856,7 @@ impl AniGpuApp {
 
         let mut go_back = false;
         let mut go_episodes = false;
+        let mut go_related = false;
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -864,7 +880,7 @@ impl AniGpuApp {
                             go_back = true;
                         }
 
-                        ui.add_space(14.0);
+                        ui.add_space(32.0);
 
                         // ── Title ─────────────────────────────────────────────
                         ui.label(
@@ -932,8 +948,8 @@ impl AniGpuApp {
                             ui.add_space(18.0);
                         }
 
-                        // ── Action Buttons ────────────────────────────────────
-                        ui.horizontal(|ui| {
+                        // ── Action Buttons (columna vertical) ─────────────────
+                        ui.vertical(|ui| {
                             let play_btn = egui::Button::new(
                                 egui::RichText::new("▶  Reproducir")
                                     .color(egui::Color32::BLACK)
@@ -962,6 +978,22 @@ impl AniGpuApp {
                             if ui.add_sized([btn_w, btn_h], ep_btn).clicked() {
                                 go_episodes = true;
                             }
+
+                            ui.add_space(10.0);
+
+                            let rel_btn = egui::Button::new(
+                                egui::RichText::new("⊞  Relacionados")
+                                    .color(egui::Color32::WHITE)
+                                    .size(btn_font * 0.9),
+                            )
+                            .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
+                            .corner_radius(8.0);
+
+                            ui.add_enabled_ui(!details.related.is_empty(), |ui| {
+                                if ui.add_sized([btn_w, btn_h], rel_btn).clicked() {
+                                    go_related = true;
+                                }
+                            });
                         });
                     });
                 });
@@ -973,69 +1005,199 @@ impl AniGpuApp {
                 if go_episodes {
                     self.detail_tab = DetailTab::Episodes;
                 }
-
-                // ── Section below hero: Related ───────────────────────
-                if !details.related.is_empty() {
-                    ui.add_space(24.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(margin_x);
-                        ui.label(
-                            egui::RichText::new("Relacionados")
-                                .color(egui::Color32::WHITE)
-                                .size((title_size * 0.50).clamp(16.0, 22.0))
-                                .strong(),
-                        );
-                    });
-                    ui.add_space(12.0);
-
-                    let card_h = (avail_height * 0.18).clamp(100.0, 160.0);
-                    let card_w = card_h * 0.72;
-                    let spacing = 14.0;
-
-                    let (strip_rect, _) = ui.allocate_exact_size(
-                        egui::vec2(avail_width, card_h + 45.0),
-                        egui::Sense::hover(),
-                    );
-
-                    for (idx, rel) in details.related.iter().enumerate() {
-                        let cx = strip_rect.min.x + margin_x + idx as f32 * (card_w + spacing);
-                        if cx > strip_rect.max.x {
-                            break;
-                        }
-
-                        let card_rect = egui::Rect::from_min_size(
-                            egui::pos2(cx, strip_rect.min.y),
-                            egui::vec2(card_w, card_h),
-                        );
-
-                        if let Some(img) = &rel.image {
-                            let image = egui::Image::new(img)
-                                .fit_to_exact_size(card_rect.size())
-                                .corner_radius(6.0);
-                            image.paint_at(ui, card_rect);
-                        } else {
-                            ui.painter().rect_filled(
-                                card_rect,
-                                6.0,
-                                egui::Color32::from_rgb(28, 28, 35),
-                            );
-                        }
-
-                        let text_rect = egui::Rect::from_min_size(
-                            egui::pos2(cx, card_rect.max.y + 5.0),
-                            egui::vec2(card_w, 36.0),
-                        );
-                        let mut t_ui = ui.new_child(egui::UiBuilder::new().max_rect(text_rect));
-                        t_ui.label(
-                            egui::RichText::new(&rel.title)
-                                .color(egui::Color32::from_rgb(180, 180, 195))
-                                .size(11.0),
-                        );
-                    }
+                if go_related {
+                    self.detail_tab = DetailTab::Related;
                 }
 
                 ui.add_space(40.0);
             });
+    }
+
+    /// RELATED subview: header + scrollable grid of related animes
+    fn render_detail_related(
+        &mut self,
+        ui: &mut egui::Ui,
+        details: &AnimeDetails,
+        backdrop_url: &Option<String>,
+        bg_color: egui::Color32,
+        avail_width: f32,
+        avail_height: f32,
+    ) {
+        let margin_x = (avail_width * 0.035).clamp(24.0, 52.0);
+        let title_size = (avail_width * 0.022).clamp(20.0, 36.0);
+        let sub_size = (title_size * 0.50).clamp(12.0, 16.0);
+
+        // Top mini-backdrop header
+        let header_height = (avail_height * 0.22).clamp(120.0, 200.0);
+        let (header_rect, _) =
+            ui.allocate_exact_size(egui::vec2(avail_width, header_height), egui::Sense::hover());
+
+        if let Some(url) = backdrop_url {
+            let image = egui::Image::new(url).fit_to_exact_size(header_rect.size());
+            image.paint_at(ui, header_rect);
+        }
+
+        let overlay_color =
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 200);
+        ui.painter().rect_filled(header_rect, 0.0, overlay_color);
+
+        let header_fade = egui::Rect::from_min_max(
+            egui::pos2(header_rect.min.x, header_rect.max.y - 40.0),
+            header_rect.max,
+        );
+        let transparent =
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 0);
+        Self::draw_gradient_rect(ui, header_fade, transparent, transparent, bg_color, bg_color);
+
+        // Header content: back + title
+        let header_content = egui::Rect::from_min_max(
+            egui::pos2(header_rect.min.x + margin_x, header_rect.min.y + 16.0),
+            egui::pos2(header_rect.max.x - margin_x, header_rect.max.y - 10.0),
+        );
+        let mut h_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(header_content)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+
+        let back = egui::Button::new(
+            egui::RichText::new("←  Volver a información")
+                .color(egui::Color32::from_rgb(200, 200, 220))
+                .size(sub_size),
+        )
+        .fill(egui::Color32::TRANSPARENT);
+        if h_ui.add(back).clicked() {
+            self.detail_tab = DetailTab::Info;
+            return;
+        }
+
+        h_ui.add_space(6.0);
+        h_ui.label(
+            egui::RichText::new(&details.title)
+                .color(egui::Color32::WHITE)
+                .size(title_size)
+                .strong(),
+        );
+        h_ui.add_space(4.0);
+        h_ui.label(
+            egui::RichText::new(format!("{} relacionados", details.related.len()))
+                .color(egui::Color32::from_rgb(160, 160, 180))
+                .size(sub_size),
+        );
+
+        // ── Body: grid de tarjetas ─────────────────────────────────
+        let body_height = avail_height - header_height;
+        let body_rect = egui::Rect::from_min_size(
+            egui::pos2(header_rect.min.x, header_rect.max.y),
+            egui::vec2(avail_width, body_height),
+        );
+        let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body_rect));
+
+        let card_h = (avail_height * 0.30).clamp(180.0, 300.0);
+        let card_w = card_h * 0.70;
+        let card_spacing = 18.0;
+        let usable_w = avail_width - margin_x * 2.0 - 18.0;
+        let per_row = ((usable_w + card_spacing) / (card_w + card_spacing))
+            .floor()
+            .max(1.0) as usize;
+
+        let mut nav_target: Option<LatestItem> = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("related_grid")
+            .auto_shrink([false, false])
+            .show(&mut body_ui, |ui| {
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(margin_x);
+                    ui.label(
+                        egui::RichText::new("Relacionados")
+                            .color(egui::Color32::WHITE)
+                            .size((title_size * 0.55).clamp(16.0, 22.0))
+                            .strong(),
+                    );
+                });
+                ui.add_space(12.0);
+
+                for row in details.related.chunks(per_row) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(margin_x);
+
+                        for rel in row {
+                            let (card_rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(card_w, card_h + 44.0),
+                                egui::Sense::click(),
+                            );
+
+                            if resp.clicked() {
+                                nav_target = Some(LatestItem {
+                                    title: rel.title.clone(),
+                                    episode: None,
+                                    image: rel.image.clone(),
+                                    cover: None,
+                                    anime_url: Some(rel.url.clone()),
+                                    url: rel.url.clone(),
+                                });
+                            }
+
+                            let img_rect = egui::Rect::from_min_size(
+                                card_rect.min,
+                                egui::vec2(card_w, card_h),
+                            );
+
+                            if let Some(img) = &rel.image {
+                                let image = egui::Image::new(img)
+                                    .fit_to_exact_size(img_rect.size())
+                                    .corner_radius(8.0);
+                                image.paint_at(ui, img_rect);
+                            } else {
+                                ui.painter().rect_filled(
+                                    img_rect,
+                                    8.0,
+                                    egui::Color32::from_rgb(28, 28, 35),
+                                );
+                            }
+
+                            let stroke = if resp.hovered() {
+                                egui::Stroke::new(3.0, egui::Color32::WHITE)
+                            } else {
+                                egui::Stroke::new(
+                                    1.5,
+                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50),
+                                )
+                            };
+                            ui.painter().rect_stroke(
+                                img_rect,
+                                8.0,
+                                stroke,
+                                egui::StrokeKind::Outside,
+                            );
+
+                            let text_rect = egui::Rect::from_min_size(
+                                egui::pos2(card_rect.min.x, img_rect.max.y + 8.0),
+                                egui::vec2(card_w, 36.0),
+                            );
+                            let mut t_ui = ui.new_child(egui::UiBuilder::new().max_rect(text_rect));
+                            t_ui.label(
+                                egui::RichText::new(&rel.title)
+                                    .color(egui::Color32::from_rgb(210, 210, 225))
+                                    .size(13.0)
+                                    .strong(),
+                            );
+
+                            ui.add_space(card_spacing);
+                        }
+                    });
+                    ui.add_space(card_spacing);
+                }
+
+                ui.add_space(30.0);
+            });
+
+        if let Some(item) = nav_target {
+            let ctx = ui.ctx().clone();
+            self.navigate_to_detail(&item, ctx);
+        }
     }
 
     /// EPISODES tab: title header on the left, scrollable episode list on the right
@@ -1494,16 +1656,25 @@ impl AniGpuApp {
 
             // Botón Ver Detalles (solo icono de tres puntos)
             ui.add_space(8.0);
-            let detail_btn = egui::Button::new(
-                egui::RichText::new("⋮")
-                    .color(egui::Color32::WHITE)
-                    .size(btn_font_size * 1.1),
-            )
-            .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
-            .corner_radius(8.0);
+            let detail_btn = egui::Button::new(egui::RichText::new("").size(btn_font_size))
+                .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
+                .corner_radius(8.0);
 
-            if ui.add_sized([btn_height, btn_height], detail_btn).clicked() {
+            let detail_resp = ui.add_sized([btn_height, btn_height], detail_btn);
+            if detail_resp.clicked() {
                 nav_target = Some(hero.clone());
+            }
+
+            // Tres puntos dibujados (el glifo ⋮ no existe en las fuentes por defecto)
+            let dot_r = (btn_height * 0.055).clamp(2.0, 3.0);
+            let dot_gap = dot_r * 2.8;
+            let dot_center = detail_resp.rect.center();
+            for offset in [-1.0, 0.0, 1.0] {
+                ui.painter().circle_filled(
+                    egui::pos2(dot_center.x, dot_center.y + offset * dot_gap),
+                    dot_r,
+                    egui::Color32::WHITE,
+                );
             }
         });
 
