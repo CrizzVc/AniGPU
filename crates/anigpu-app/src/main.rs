@@ -86,16 +86,17 @@ struct AniGpuApp {
 
 impl AniGpuApp {
     fn cache_file_path() -> Option<std::path::PathBuf> {
-        directories::ProjectDirs::from("", "", "AniGPU").map(|dirs| {
-            dirs.cache_dir().join("tmdb_backdrops.json")
-        })
+        directories::ProjectDirs::from("", "", "AniGPU")
+            .map(|dirs| dirs.cache_dir().join("tmdb_backdrops.json"))
     }
 
     fn load_tmdb_cache() -> std::collections::HashMap<String, String> {
         if let Some(path) = Self::cache_file_path() {
             if path.exists() {
                 if let Ok(data) = std::fs::read_to_string(&path) {
-                    if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(&data) {
+                    if let Ok(map) =
+                        serde_json::from_str::<std::collections::HashMap<String, String>>(&data)
+                    {
                         return map;
                     }
                 }
@@ -120,7 +121,8 @@ impl AniGpuApp {
         let (tx_tmdb, rx_tmdb) = channel();
         let (tx_detail, rx_detail) = channel();
         let tmdb_cache = Self::load_tmdb_cache();
-        let tmdb_requested: std::collections::HashSet<String> = tmdb_cache.keys().cloned().collect();
+        let tmdb_requested: std::collections::HashSet<String> =
+            tmdb_cache.keys().cloned().collect();
         Self {
             rt,
             items: None,
@@ -1352,7 +1354,7 @@ impl AniGpuApp {
         let btn_height = (hero_height * 0.06).clamp(38.0, 48.0);
 
         // Dimensiones dinámicas de las tarjetas del carrusel (16:9)
-        let card_height = (avail_height * 0.17).clamp(100.0, 160.0);
+        let card_height = (avail_height * 0.22).clamp(130.0, 210.0);
         let card_width = card_height * (16.0 / 9.0);
         let card_spacing = (avail_width * 0.012).clamp(12.0, 22.0);
 
@@ -1431,7 +1433,7 @@ impl AniGpuApp {
 
         // === Contenido Hero (Episodio -> Título -> Botones) ===
         // Posicionar en la zona media-inferior, por encima del carrusel
-        let carousel_zone_height = card_height + 55.0 + 50.0; // carrusel + label + espacios
+        let carousel_zone_height = card_height + 55.0 + 50.0 + 45.0; // carrusel + label + espacios
         let hero_content_height = subtitle_size + title_size + btn_height * 2.0 + 60.0;
         let hero_content_y = rect.max.y - carousel_zone_height - hero_content_height - 10.0;
         let hero_content_rect = egui::Rect::from_min_max(
@@ -1475,36 +1477,35 @@ impl AniGpuApp {
 
         ui_hero.add_space(14.0);
 
-        // Botón Reproducir
-        let btn = egui::Button::new(
-            egui::RichText::new("▶  Reproducir")
-                .color(egui::Color32::BLACK)
-                .size(btn_font_size)
-                .strong(),
-        )
-        .fill(egui::Color32::WHITE)
-        .corner_radius(8.0);
+        // Botones Reproducir + Ver Detalles (en fila)
+        ui_hero.horizontal(|ui| {
+            let btn = egui::Button::new(
+                egui::RichText::new("▶  Reproducir")
+                    .color(egui::Color32::BLACK)
+                    .size(btn_font_size)
+                    .strong(),
+            )
+            .fill(egui::Color32::WHITE)
+            .corner_radius(8.0);
 
-        if ui_hero.add_sized([btn_width, btn_height], btn).clicked() {
-            println!("Reproducir: {}", hero.url);
-        }
+            if ui.add_sized([btn_width, btn_height], btn).clicked() {
+                println!("Reproducir: {}", hero.url);
+            }
 
-        // Botón Ver Detalles
-        ui_hero.add_space(8.0);
-        let detail_btn = egui::Button::new(
-            egui::RichText::new("ℹ  Ver detalles")
-                .color(egui::Color32::WHITE)
-                .size(btn_font_size * 0.9),
-        )
-        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
-        .corner_radius(8.0);
+            // Botón Ver Detalles (solo icono de tres puntos)
+            ui.add_space(8.0);
+            let detail_btn = egui::Button::new(
+                egui::RichText::new("⋮")
+                    .color(egui::Color32::WHITE)
+                    .size(btn_font_size * 1.1),
+            )
+            .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15))
+            .corner_radius(8.0);
 
-        if ui_hero
-            .add_sized([btn_width, btn_height * 0.85], detail_btn)
-            .clicked()
-        {
-            nav_target = Some(hero.clone());
-        }
+            if ui.add_sized([btn_height, btn_height], detail_btn).clicked() {
+                nav_target = Some(hero.clone());
+            }
+        });
 
         // === Carrusel de capítulos superpuesto en la parte inferior del banner ===
         let carousel_top = rect.max.y - carousel_zone_height + 5.0;
