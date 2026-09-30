@@ -170,6 +170,15 @@ async fn extract(
     }
 }
 
+async fn list_sources() -> Json<ApiResponse<DataWrapper<Vec<anigpu_core::models::SourceInfo>>>> {
+    Json(ApiResponse {
+        success: true,
+        data: DataWrapper {
+            data: sources::all_sources(),
+        },
+    })
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
@@ -181,6 +190,7 @@ async fn main() {
         .route("/api/search", get(search))
         .route("/api/browse", get(browse))
         .route("/api/extract", get(extract))
+        .route("/api/sources", get(list_sources))
         .layer(CorsLayer::permissive());
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
