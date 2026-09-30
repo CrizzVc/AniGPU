@@ -88,6 +88,107 @@ impl AniGpuApp {
         });
     }
 
+async fn fetch_tmdb_backdrop(title: &str) -> Option<String> {
+    let api_key = "647aef6fffac587fb62b2057cf9347aa";
+    
+    // Lista de candidatos de búsqueda en orden de especificidad
+    let mut candidates = Vec::new();
+
+    // 1. Limpieza de sufijos comunes de doblaje / formato
+    let base_clean = title
+        .replace(" (TV)", "")
+        .replace(" (TV 2024)", "")
+        .replace(" (TV 2025)", "")
+        .replace(" (Audio Latino)", "")
+        .replace(" (Latino)", "")
+        .replace(" (Castellano)", "")
+        .replace(" (Sub Español)", "")
+        .replace(" (Doblaje)", "")
+        .trim()
+        .to_string();
+
+    candidates.push(base_clean.clone());
+
+    // 2. Si contiene "Season", "Temporada", "Part", etc., extraer el título base
+    let season_patterns = [
+        regex::Regex::new(r"(?i)\s+(?:(?:\d+(?:st|nd|rd|th)?|final|second|third|fourth|segunda|tercera|cuarta)\s+)?(?:season|temporada|part|parte|cour).*").unwrap(),
+        regex::Regex::new(r"(?i)\s+(?:season|temporada)\s+\d+.*").unwrap(),
+        regex::Regex::new(r"(?i)\s+s\d+.*").unwrap(),
+    ];
+
+    let mut stripped_season = base_clean.clone();
+    for pat in &season_patterns {
+        if pat.is_match(&stripped_season) {
+            stripped_season = pat.replace(&stripped_season, "").trim().to_string();
+        }
+    }
+    if !stripped_season.is_empty() && stripped_season != base_clean {
+        candidates.push(stripped_season.clone());
+    }
+
+    // 3. Si aún tiene subtítulos con " - " o ":", intentar con el título principal
+    if let Some(pos) = stripped_season.find(" - ") {
+        let prefix = stripped_season[..pos].trim().to_string();
+        if !prefix.is_empty() && !candidates.contains(&prefix) {
+            candidates.push(prefix);
+        }
+    } else if let Some(pos) = stripped_season.find(':') {
+        let prefix = stripped_season[..pos].trim().to_string();
+        if prefix.len() >= 3 && !candidates.contains(&prefix) {
+            candidates.push(prefix);
+        }
+    }
+
+    // Realizar búsquedas en TMDB por cada candidato, priorizando siempre Series (TV) sobre Películas
+    for query in &candidates {
+        if query.is_empty() {
+            continue;
+        }
+
+        let endpoints = ["search/tv", "search/multi"];
+        let languages = [Some("es-MX"), None];
+
+        for endpoint in &endpoints {
+            for lang in &languages {
+                let mut url = format!(
+                    "https://api.themoviedb.org/3/{}?api_key={}&query={}&include_adult=false",
+                    endpoint,
+                    api_key,
+                    urlencoding::encode(query)
+                );
+                if let Some(l) = lang {
+                    url.push_str(&format!("&language={}", l));
+                }
+
+                if let Ok(resp) = reqwest::get(&url).await {
+                    if let Ok(json) = resp.json::<serde_json::Value>().await {
+                        if let Some(results) = json["results"].as_array() {
+                            // 1ra pasada: Prioridad estricta a series de TV / Anime
+                            for res in results {
+                                let media_type = res["media_type"].as_str().unwrap_or("tv");
+                                if media_type == "tv" {
+                                    if let Some(path) = res["backdrop_path"].as_str() {
+                                        return Some(format!("https://image.tmdb.org/t/p/original{}", path));
+                                    }
+                                }
+                            }
+
+                            // 2da pasada: Si no hubo serie, aceptar película si tiene fondo
+                            for res in results {
+                                if let Some(path) = res["backdrop_path"].as_str() {
+                                    return Some(format!("https://image.tmdb.org/t/p/original{}", path));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
         let sidebar_width = ui.available_width();
         
@@ -338,24 +439,7 @@ impl AniGpuApp {
                         let ctx = ui.ctx().clone();
                         
                         self.rt.spawn(async move {
-                            let api_key = "647aef6fffac587fb62b2057cf9347aa";
-                            let clean_title = title.replace(" (TV)", "").replace(" (TV 2024)", ""); 
-                            let url = format!("https://api.themoviedb.org/3/search/multi?api_key={}&query={}&language=es-MX", api_key, urlencoding::encode(&clean_title));
-                            
-                            let mut found = None;
-                            if let Ok(resp) = reqwest::get(&url).await {
-                                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                                    if let Some(results) = json["results"].as_array() {
-                                        for res in results {
-                                            if let Some(path) = res["backdrop_path"].as_str() {
-                                                found = Some(format!("https://image.tmdb.org/t/p/original{}", path));
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            
+                            let found = Self::fetch_tmdb_backdrop(&title).await;
                             if let Some(u) = found {
                                 let _ = tx_tmdb.send((title, u));
                                 ctx.request_repaint();
