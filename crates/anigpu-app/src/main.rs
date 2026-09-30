@@ -149,6 +149,8 @@ struct AniGpuApp {
     tx_detail: Sender<Result<AnimeDetails, String>>,
     detail_backdrop_url: Option<String>,
     detail_backdrop_requested: bool,
+    /// Grupo/bloque de episodios seleccionado en la subvista de episodios
+    episode_group: usize,
 }
 
 impl AniGpuApp {
@@ -340,6 +342,7 @@ impl AniGpuApp {
             tx_detail,
             detail_backdrop_url: None,
             detail_backdrop_requested: false,
+            episode_group: 0,
         }
     }
 
@@ -375,6 +378,7 @@ impl AniGpuApp {
         self.detail_tab = DetailTab::Info;
         self.detail_backdrop_url = None;
         self.detail_backdrop_requested = false;
+        self.episode_group = 0;
 
         let tx = self.tx_detail.clone();
         self.rt.spawn(async move {
@@ -1352,8 +1356,7 @@ impl AniGpuApp {
         let full_bg_rect =
             egui::Rect::from_min_size(ui.cursor().min, egui::vec2(avail_width, avail_height));
         if let Some(url) = backdrop_url {
-            let image = egui::Image::new(url).fit_to_exact_size(full_bg_rect.size());
-            image.paint_at(ui, full_bg_rect);
+            Self::paint_cover(ui, url, full_bg_rect);
         }
 
         // ── Strong left-side dark gradient (very pronounced) ──────
@@ -1590,28 +1593,22 @@ impl AniGpuApp {
             ui.allocate_exact_size(egui::vec2(avail_width, header_height), egui::Sense::hover());
 
         if let Some(url) = backdrop_url {
-            let image = egui::Image::new(url).fit_to_exact_size(header_rect.size());
-            image.paint_at(ui, header_rect);
+            Self::paint_cover(ui, url, header_rect);
         }
 
         let overlay_color =
-            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 200);
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 110);
         ui.painter().rect_filled(header_rect, 0.0, overlay_color);
 
         let header_fade = egui::Rect::from_min_max(
-            egui::pos2(header_rect.min.x, header_rect.max.y - 40.0),
+            egui::pos2(header_rect.min.x, header_rect.min.y + header_height * 0.30),
             header_rect.max,
         );
         let transparent =
             egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 0);
-        Self::draw_gradient_rect(
-            ui,
-            header_fade,
-            transparent,
-            transparent,
-            bg_color,
-            bg_color,
-        );
+        let solid =
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 255);
+        Self::draw_gradient_rect(ui, header_fade, transparent, transparent, solid, solid);
 
         // Header content: back + title
         let header_content = egui::Rect::from_min_max(
@@ -1785,32 +1782,26 @@ impl AniGpuApp {
         let (header_rect, _) =
             ui.allocate_exact_size(egui::vec2(avail_width, header_height), egui::Sense::hover());
 
-        // Draw mini backdrop
+        // Draw mini backdrop (proporción original, recorte al centro)
         if let Some(url) = backdrop_url {
-            let image = egui::Image::new(url).fit_to_exact_size(header_rect.size());
-            image.paint_at(ui, header_rect);
+            Self::paint_cover(ui, url, header_rect);
         }
 
-        // Dark overlay on the header
+        // Tinte suave para que el título se lea sin apagar la imagen
         let overlay_color =
-            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 200);
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 110);
         ui.painter().rect_filled(header_rect, 0.0, overlay_color);
 
-        // Bottom fade on header
+        // Degradado inferior MUY marcado: la cabecera se funde con el contenido
         let header_fade = egui::Rect::from_min_max(
-            egui::pos2(header_rect.min.x, header_rect.max.y - 40.0),
+            egui::pos2(header_rect.min.x, header_rect.min.y + header_height * 0.30),
             header_rect.max,
         );
         let transparent =
             egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 0);
-        Self::draw_gradient_rect(
-            ui,
-            header_fade,
-            transparent,
-            transparent,
-            bg_color,
-            bg_color,
-        );
+        let solid =
+            egui::Color32::from_rgba_unmultiplied(bg_color.r(), bg_color.g(), bg_color.b(), 255);
+        Self::draw_gradient_rect(ui, header_fade, transparent, transparent, solid, solid);
 
         // Header content: title + back
         let header_content = egui::Rect::from_min_max(
@@ -1851,11 +1842,10 @@ impl AniGpuApp {
                 .size(sub_size),
         );
 
-        // ── Left sidebar (seasons / tabs) + Right episode list ────────
+        // ── Rail izquierdo (grupos de episodios) + lista de la derecha ──
         let body_height = avail_height - header_height;
-        let left_panel_w = (avail_width * 0.22).clamp(160.0, 280.0);
+        let left_panel_w = (avail_width * 0.24).clamp(200.0, 320.0);
 
-        // Allocate left panel
         let left_rect = egui::Rect::from_min_size(
             egui::pos2(header_rect.min.x, header_rect.max.y),
             egui::vec2(left_panel_w, body_height),
@@ -1865,14 +1855,38 @@ impl AniGpuApp {
             egui::pos2(header_rect.max.x, header_rect.max.y + body_height),
         );
 
-        // Left panel background
+        // Fondo del rail
         ui.painter()
             .rect_filled(left_rect, 0.0, egui::Color32::from_rgb(10, 10, 14));
 
-        // Left panel content
+        // Pocas listas → un solo grupo; muchas → bloques de 25 o 50
+        let total = details.episodes.len();
+        let group_size = if total > 150 {
+            50
+        } else if total > 30 {
+            25
+        } else {
+            total.max(1)
+        };
+        let group_count = if total == 0 {
+            0
+        } else {
+            total.div_ceil(group_size)
+        };
+        let selected = self.episode_group.min(group_count.saturating_sub(1));
+        let group_label = |index: usize| {
+            if group_count <= 1 {
+                "Episodios".to_string()
+            } else {
+                let start = index * group_size + 1;
+                let end = ((index + 1) * group_size).min(total);
+                format!("Episodios {}-{}", start, end)
+            }
+        };
+
         let left_content = egui::Rect::from_min_max(
-            egui::pos2(left_rect.min.x + margin_x * 0.5, left_rect.min.y + 20.0),
-            egui::pos2(left_rect.max.x - 10.0, left_rect.max.y - 10.0),
+            egui::pos2(left_rect.min.x + 16.0, left_rect.min.y + 22.0),
+            egui::pos2(left_rect.max.x - 12.0, left_rect.max.y - 10.0),
         );
         let mut l_ui = ui.new_child(
             egui::UiBuilder::new()
@@ -1880,112 +1894,262 @@ impl AniGpuApp {
                 .layout(egui::Layout::top_down(egui::Align::LEFT)),
         );
 
-        // "All episodes" button (simulating a season selector)
-        let all_btn = egui::Button::new(
-            egui::RichText::new("Todos los episodios")
-                .color(egui::Color32::WHITE)
-                .size(sub_size)
-                .strong(),
-        )
-        .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12))
-        .corner_radius(6.0);
-
-        l_ui.add_sized([left_panel_w - margin_x, 36.0], all_btn);
-        l_ui.add_space(8.0);
-
-        l_ui.label(
-            egui::RichText::new(format!("{} episodios", details.episodes.len()))
-                .color(egui::Color32::from_rgb(120, 120, 140))
-                .size(sub_size * 0.85),
-        );
-
-        // ── Right panel: episode list ─────────────────────────────────
-        let mut r_ui = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(right_rect)
-                .layout(egui::Layout::top_down(egui::Align::LEFT)),
-        );
-
-        let ep_thumb_h = (body_height * 0.16).clamp(70.0, 110.0);
-        let ep_thumb_w = ep_thumb_h * (16.0 / 9.0);
-        let ep_spacing = 14.0;
-        let ep_right_margin = 16.0;
-
         egui::ScrollArea::vertical()
+            .id_salt("episode_groups")
             .auto_shrink([false, false])
-            .show(&mut r_ui, |ui| {
-                ui.add_space(16.0);
+            .show(&mut l_ui, |ui| {
+                for index in 0..group_count {
+                    let count =
+                        ((index + 1) * group_size).min(total) - index * group_size;
+                    let is_selected = index == selected;
 
-                // Heading
-                ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new("Episodios")
-                            .color(egui::Color32::WHITE)
-                            .size(title_size * 0.65)
-                            .strong(),
-                    );
-                });
-
-                ui.add_space(12.0);
-
-                for (idx, ep) in details.episodes.iter().enumerate() {
-                    let ep_num_str = ep.episode.to_string();
-                    let row_height = ep_thumb_h + ep_spacing;
-
-                    let (row_rect, row_resp) = ui.allocate_exact_size(
-                        egui::vec2(right_rect.width() - ep_right_margin, row_height),
+                    let (row, resp) = ui.allocate_exact_size(
+                        egui::vec2((left_content.width() - 8.0).max(80.0), 46.0),
                         egui::Sense::click(),
                     );
 
-                    // Hover highlight
-                    if row_resp.hovered() {
+                    if is_selected {
                         ui.painter().rect_filled(
-                            row_rect,
-                            6.0,
+                            row,
+                            23.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+                        );
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(
+                            row,
+                            23.0,
                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
                         );
                     }
 
-                    if row_resp.clicked() {
-                        let anime_key = self.anime_key(details);
-                        let number = Self::episode_number(ep, idx);
-                        self.mark_episode_started(&anime_key, number);
-                        println!("Reproducir episodio {}: {}", ep_num_str, ep.url);
-                    }
-
-                    // Thumbnail area
-                    let thumb_rect = egui::Rect::from_min_size(
-                        egui::pos2(row_rect.min.x + 8.0, row_rect.min.y + ep_spacing * 0.5),
-                        egui::vec2(ep_thumb_w, ep_thumb_h),
+                    let label_color = if is_selected {
+                        egui::Color32::WHITE
+                    } else {
+                        egui::Color32::from_rgb(150, 150, 165)
+                    };
+                    ui.painter().text(
+                        egui::pos2(row.min.x + 16.0, row.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        group_label(index),
+                        egui::FontId::proportional((sub_size * 1.15).max(14.0)),
+                        label_color,
+                    );
+                    ui.painter().text(
+                        egui::pos2(row.max.x - 16.0, row.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        format!("{} episodios", count),
+                        egui::FontId::proportional(sub_size * 0.95),
+                        egui::Color32::from_rgb(120, 120, 140),
                     );
 
+                    if resp.clicked() {
+                        self.episode_group = index;
+                    }
+                }
+            });
+
+        // ── Cabecera de la lista: grupo + estado + géneros ────────────
+        let head_h = 58.0;
+        let head_rect = egui::Rect::from_min_size(
+            right_rect.min,
+            egui::vec2(right_rect.width(), head_h),
+        );
+        let list_rect = egui::Rect::from_min_max(
+            egui::pos2(right_rect.min.x, right_rect.min.y + head_h),
+            right_rect.max,
+        );
+
+        let mut head_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_size(
+                    egui::pos2(head_rect.min.x + 20.0, head_rect.min.y),
+                    egui::vec2((head_rect.width() - 32.0).max(120.0), head_rect.height()),
+                ))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+
+        head_ui.label(
+            egui::RichText::new(group_label(selected))
+                .color(egui::Color32::WHITE)
+                .size((title_size * 0.62).clamp(16.0, 26.0))
+                .strong(),
+        );
+
+        if let Some(status) = details
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            head_ui.add_space(10.0);
+            head_ui.add(
+                egui::Button::new(
+                    egui::RichText::new(status)
+                        .color(egui::Color32::WHITE)
+                        .size(sub_size * 0.95),
+                )
+                .fill(egui::Color32::TRANSPARENT)
+                .stroke(egui::Stroke::new(
+                    1.2,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150),
+                ))
+                .corner_radius(6.0),
+            );
+            head_ui.add_space(10.0);
+        }
+
+        if !details.genres.is_empty() {
+            head_ui.add(
+                egui::Label::new(
+                    egui::RichText::new(details.genres.join(", "))
+                        .color(egui::Color32::from_rgb(160, 160, 180))
+                        .size(sub_size),
+                )
+                .truncate(),
+            );
+        }
+
+        // ── Lista de episodios ────────────────────────────────────────
+        let mut list_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(list_rect)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+
+        if total == 0 {
+            list_ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("Este anime no tiene episodios listados.")
+                        .color(egui::Color32::from_rgb(150, 150, 165))
+                        .size(sub_size * 1.1),
+                );
+            });
+            return;
+        }
+
+        let range_start = selected * group_size;
+        let range_end = (range_start + group_size).min(total);
+
+        let row_w = (list_rect.width() - 26.0).max(200.0);
+        let thumb_w = (row_w * 0.42).clamp(180.0, 360.0);
+        let thumb_h = thumb_w * (9.0 / 16.0);
+        let row_h = thumb_h + 34.0;
+
+        // Estado de visionado clonado: el cierre no debe tocar `self`
+        let anime_key = self.anime_key(details);
+        let progress = self.watch_progress.get(&anime_key).cloned();
+        let mut clicked_episode: Option<i64> = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("episodes_list")
+            .auto_shrink([false, false])
+            .show(&mut list_ui, |ui| {
+                ui.add_space(6.0);
+
+                for (offset, ep) in details.episodes[range_start..range_end]
+                    .iter()
+                    .enumerate()
+                {
+                    let idx = range_start + offset;
+                    let number = Self::episode_number(ep, idx);
+                    let label = ep.episode.to_string();
+
+                    let (row_rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(row_w, row_h), egui::Sense::click());
+
+                    if resp.clicked() {
+                        clicked_episode = Some(number);
+                    }
+
+                    let thumb_rect = egui::Rect::from_min_size(
+                        egui::pos2(row_rect.min.x, row_rect.min.y + 8.0),
+                        egui::vec2(thumb_w, thumb_h),
+                    );
+
+                    ui.painter()
+                        .rect_filled(thumb_rect, 8.0, egui::Color32::from_rgb(24, 24, 32));
+
                     if let Some(img) = &ep.image {
-                        let image = egui::Image::new(img)
+                        egui::Image::new(img)
                             .fit_to_exact_size(thumb_rect.size())
-                            .corner_radius(6.0);
-                        image.paint_at(ui, thumb_rect);
+                            .corner_radius(8.0)
+                            .paint_at(ui, thumb_rect);
                     } else {
-                        // Placeholder thumbnail with episode number
-                        ui.painter().rect_filled(
-                            thumb_rect,
-                            6.0,
-                            egui::Color32::from_rgb(30, 30, 40),
-                        );
                         ui.painter().text(
                             thumb_rect.center(),
                             egui::Align2::CENTER_CENTER,
-                            format!("E{}", ep_num_str),
-                            egui::FontId::proportional(sub_size * 1.2),
-                            egui::Color32::from_rgb(100, 100, 120),
+                            format!("E{}", label),
+                            egui::FontId::proportional((thumb_h * 0.26).clamp(18.0, 32.0)),
+                            egui::Color32::from_rgb(74, 74, 92),
                         );
                     }
 
-                    // Episode info text beside the thumbnail
-                    let text_x = thumb_rect.max.x + 16.0;
+                    // Degradado inferior + etiqueta "E12"
+                    let fade = egui::Rect::from_min_max(
+                        egui::pos2(thumb_rect.min.x, thumb_rect.max.y - 56.0),
+                        thumb_rect.max,
+                    );
+                    let clear = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0);
+                    let shaded = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 175);
+                    Self::draw_gradient_rect(ui, fade, clear, clear, shaded, shaded);
+
+                    ui.painter().text(
+                        egui::pos2(thumb_rect.min.x + 13.0, thumb_rect.max.y - 11.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        format!("E{}", label),
+                        egui::FontId::proportional(17.0),
+                        egui::Color32::WHITE,
+                    );
+
+                    // Barra de progreso bajo la miniatura
+                    let bar_rect = egui::Rect::from_min_max(
+                        egui::pos2(thumb_rect.min.x, thumb_rect.max.y + 6.0),
+                        egui::pos2(thumb_rect.max.x, thumb_rect.max.y + 10.0),
+                    );
+                    ui.painter().rect_filled(
+                        bar_rect,
+                        2.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+                    );
+
+                    let seen = progress
+                        .as_ref()
+                        .map(|p| p.completed.contains(&number))
+                        .unwrap_or(false);
+                    let current_pos = progress
+                        .as_ref()
+                        .and_then(|p| p.current.as_ref())
+                        .filter(|c| c.ep == number)
+                        .map(|c| c.position.clamp(0.05, 0.95));
+                    let fraction = if seen { 1.0 } else { current_pos.unwrap_or(0.0) };
+                    if fraction > 0.0 {
+                        let fill = egui::Rect::from_min_max(
+                            bar_rect.min,
+                            egui::pos2(
+                                bar_rect.min.x + bar_rect.width() * fraction,
+                                bar_rect.max.y,
+                            ),
+                        );
+                        ui.painter()
+                            .rect_filled(fill, 2.0, egui::Color32::from_rgb(229, 9, 14));
+                    }
+
+                    // Borde de la miniatura (blanco al pasar el ratón)
+                    let stroke = if resp.hovered() {
+                        egui::Stroke::new(3.0, egui::Color32::WHITE)
+                    } else {
+                        egui::Stroke::new(
+                            1.5,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 45),
+                        )
+                    };
+                    ui.painter()
+                        .rect_stroke(thumb_rect, 8.0, stroke, egui::StrokeKind::Outside);
+
+                    // Texto a la derecha de la miniatura
                     let text_rect = egui::Rect::from_min_max(
-                        egui::pos2(text_x, thumb_rect.min.y + 4.0),
-                        egui::pos2(row_rect.max.x - 8.0, thumb_rect.max.y),
+                        egui::pos2(thumb_rect.max.x + 22.0, thumb_rect.min.y + 4.0),
+                        egui::pos2(row_rect.max.x, thumb_rect.max.y),
                     );
                     let mut t_ui = ui.new_child(
                         egui::UiBuilder::new()
@@ -1994,24 +2158,43 @@ impl AniGpuApp {
                     );
 
                     t_ui.label(
-                        egui::RichText::new(format!("Episodio {}", ep_num_str))
+                        egui::RichText::new(format!("Episodio {}", label))
                             .color(egui::Color32::WHITE)
-                            .size(sub_size * 1.1)
+                            .size((sub_size * 1.35).clamp(15.0, 21.0))
                             .strong(),
                     );
+                    t_ui.add_space(7.0);
 
-                    t_ui.add_space(4.0);
-
-                    // Play icon hint
+                    let (state_text, state_color) = if seen {
+                        ("Visto".to_string(), egui::Color32::from_rgb(120, 195, 125))
+                    } else if let Some(pos) = current_pos {
+                        (
+                            format!("En reproducción · {}%", (pos * 100.0).round()),
+                            egui::Color32::from_rgb(255, 110, 110),
+                        )
+                    } else {
+                        ("Pendiente".to_string(), egui::Color32::from_rgb(150, 150, 165))
+                    };
                     t_ui.label(
-                        egui::RichText::new("▶ Reproducir")
+                        egui::RichText::new(state_text)
+                            .color(state_color)
+                            .size(sub_size * 0.95),
+                    );
+                    t_ui.add_space(7.0);
+                    t_ui.label(
+                        egui::RichText::new("▶  Reproducir")
                             .color(egui::Color32::from_rgb(120, 120, 145))
-                            .size(sub_size * 0.85),
+                            .size(sub_size * 0.9),
                     );
                 }
 
                 ui.add_space(30.0);
             });
+
+        if let Some(number) = clicked_episode {
+            self.mark_episode_started(&anime_key, number);
+            println!("Reproducir episodio {}", number);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2378,6 +2561,29 @@ impl AniGpuApp {
     // ═══════════════════════════════════════════════════════════════════════════
     //  Utility: draw a gradient rectangle with 4-corner colors
     // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Pinta una imagen dentro de `rect` conservando su proporción
+    /// (recorte tipo "cover": se llena el rectángulo y se corta por el centro).
+    fn paint_cover(ui: &mut egui::Ui, url: &str, rect: egui::Rect) {
+        let image = egui::Image::new(url);
+        let natural = image
+            .load_for_size(ui.ctx(), rect.size())
+            .ok()
+            .and_then(|poll| poll.size());
+
+        let paint_rect = match natural {
+            Some(size) if size.x > 0.0 && size.y > 0.0 => {
+                let scale = (rect.width() / size.x).max(rect.height() / size.y);
+                egui::Rect::from_center_size(rect.center(), size * scale)
+            }
+            _ => rect,
+        };
+
+        let previous_clip = ui.clip_rect();
+        ui.set_clip_rect(rect);
+        image.paint_at(ui, paint_rect);
+        ui.set_clip_rect(previous_clip);
+    }
 
     fn draw_gradient_rect(
         ui: &mut egui::Ui,
