@@ -1,4 +1,4 @@
-use anigpu_core::models::{AnimeDetails, EpisodeItem, LatestItem};
+use anigpu_core::models::{AnimeDetails, CardItem, EpisodeItem, LatestItem};
 use anigpu_core::sources::get_source;
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,7 @@ fn main() -> eframe::Result<()> {
 #[allow(dead_code)]
 enum Screen {
     Home,
+    Search,
     Detail {
         /// The URL used to fetch details (anime page URL)
         anime_url: String,
@@ -81,6 +82,29 @@ struct WatchProgress {
     current: Option<CurrentEpisode>,
 }
 
+/// La portada se deriva del miniaturizado: en animeav1 el id del anime es el
+/// mismo en `thumbnails/` y `covers/`, así que no hace falta pedir nada.
+fn cover_from_thumb(url: &str) -> Option<String> {
+    let (base, file) = url.rsplit_once("/thumbnails/")?;
+    let id = file.split('.').next()?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(format!("{base}/covers/{id}.jpg"))
+}
+
+/// Fila de la vista de búsqueda (sugerencias de la izquierda y grid de la derecha).
+#[derive(Clone)]
+struct SearchRow {
+    title: String,
+    url: String,
+    anime_url: Option<String>,
+    /// Portada mostrada en el grid (la misma que la de los resultados de búsqueda)
+    image: Option<String>,
+    /// Imagen ancha usada como fondo de la vista de detalle
+    hero: Option<String>,
+}
+
 struct AniGpuApp {
     rt: Arc<Runtime>,
     items: Option<Vec<LatestItem>>,
@@ -90,6 +114,21 @@ struct AniGpuApp {
     tx: Sender<Result<Vec<LatestItem>, String>>,
     focused_index: usize,
     selected_tab: usize,
+
+    // Búsqueda de animes
+    search_query: String,
+    search_results: Vec<CardItem>,
+    search_loading: bool,
+    search_error: Option<String>,
+    /// Última consulta ya disparada (para no repetir peticiones)
+    search_sent: String,
+    /// Momento del último cambio de texto (debounce)
+    search_changed_at: std::time::Instant,
+    /// Poner el foco en el input la próxima vez que se pinte la vista
+    search_focus: bool,
+    rx_search: Receiver<(String, Result<Vec<CardItem>, String>)>,
+    tx_search: Sender<(String, Result<Vec<CardItem>, String>)>,
+
     tmdb_cache: std::collections::HashMap<String, String>,
     rx_tmdb: Receiver<(String, String)>,
     tx_tmdb: Sender<(String, String)>,
@@ -260,6 +299,7 @@ impl AniGpuApp {
         let (tx, rx) = channel();
         let (tx_tmdb, rx_tmdb) = channel();
         let (tx_detail, rx_detail) = channel();
+        let (tx_search, rx_search) = channel();
         let tmdb_cache = Self::load_tmdb_cache();
         let tmdb_requested: std::collections::HashSet<String> =
             tmdb_cache.keys().cloned().collect();
@@ -272,6 +312,17 @@ impl AniGpuApp {
             tx,
             focused_index: 0,
             selected_tab: 0,
+
+            search_query: String::new(),
+            search_results: Vec::new(),
+            search_loading: false,
+            search_error: None,
+            search_sent: String::new(),
+            search_changed_at: std::time::Instant::now(),
+            search_focus: false,
+            rx_search,
+            tx_search,
+
             tmdb_cache,
             rx_tmdb,
             tx_tmdb,
@@ -597,6 +648,7 @@ impl AniGpuApp {
 
             if resp.clicked() {
                 self.selected_tab = 0;
+                self.screen = Screen::Home;
             }
 
             if is_active {
@@ -690,6 +742,51 @@ impl AniGpuApp {
             }
         });
 
+        ui.add_space(12.0);
+
+        // Tab 2: Buscar (lupa)
+        ui.vertical_centered(|ui| {
+            let is_active = self.selected_tab == 2;
+            let (rect, resp) = ui.allocate_exact_size(btn_size, egui::Sense::click());
+
+            if resp.clicked() {
+                self.selected_tab = 2;
+                self.search_focus = true;
+                self.screen = Screen::Search;
+            }
+
+            if is_active {
+                ui.painter()
+                    .rect_filled(rect, 9.0, egui::Color32::from_rgb(32, 32, 38));
+            } else if resp.hovered() {
+                ui.painter()
+                    .rect_filled(rect, 9.0, egui::Color32::from_rgb(22, 22, 28));
+            }
+
+            let search_col = if is_active {
+                egui::Color32::WHITE
+            } else if resp.hovered() {
+                egui::Color32::from_rgb(200, 200, 210)
+            } else {
+                egui::Color32::from_rgb(110, 110, 125)
+            };
+
+            // Lupa: círculo + mango
+            let glass_center = rect.center() + egui::vec2(-1.8, -1.8);
+            ui.painter().circle_stroke(
+                glass_center,
+                6.0,
+                egui::Stroke::new(1.9, search_col),
+            );
+            ui.painter().line_segment(
+                [
+                    glass_center + egui::vec2(4.3, 4.3),
+                    rect.center() + egui::vec2(7.5, 7.5),
+                ],
+                egui::Stroke::new(1.9, search_col),
+            );
+        });
+
         // --- 3. Sección Inferior (Ayuda + Perfil) ---
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
             ui.add_space(10.0);
@@ -742,6 +839,315 @@ impl AniGpuApp {
                 h_col,
             );
         });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  SEARCH VIEW (input + sugerencias + grid de resultados)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    fn render_search_view(&mut self, ui: &mut egui::Ui) {
+        // Escape → volver al inicio
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.screen = Screen::Home;
+            self.selected_tab = 0;
+            return;
+        }
+
+        // Resultado que llega del canal (solo si corresponde a la última consulta)
+        if let Ok((query, result)) = self.rx_search.try_recv() {
+            if query == self.search_sent {
+                self.search_loading = false;
+                match result {
+                    Ok(items) => {
+                        self.search_error = None;
+                        self.search_results = items;
+                    }
+                    Err(e) => self.search_error = Some(e),
+                }
+            }
+        }
+
+        let avail_width = ui.available_width();
+        let avail_height = ui.available_height();
+        let margin = (avail_width * 0.03).clamp(24.0, 48.0);
+        let left_w = (avail_width * 0.26).clamp(280.0, 380.0);
+        let gap = 28.0;
+
+        let (root, _) =
+            ui.allocate_exact_size(egui::vec2(avail_width, avail_height), egui::Sense::hover());
+
+        // ── Columna izquierda: input + sugerencias ───────────────────
+        let input_rect = egui::Rect::from_min_size(
+            egui::pos2(root.min.x + margin, root.min.y + margin),
+            egui::vec2(left_w - margin, 46.0),
+        );
+        let suggest_rect = egui::Rect::from_min_max(
+            egui::pos2(input_rect.min.x, input_rect.max.y + 18.0),
+            egui::pos2(input_rect.max.x, root.max.y - margin),
+        );
+
+        // ── Derecha: grid de pósters ─────────────────────────────────
+        let grid_rect = egui::Rect::from_min_max(
+            egui::pos2(root.min.x + left_w + gap, root.min.y + margin),
+            egui::pos2(root.max.x - margin, root.max.y - margin),
+        );
+
+        // Input de búsqueda
+        let mut input_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(input_rect)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+        let output = egui::TextEdit::singleline(&mut self.search_query)
+            .hint_text("Buscar animes…")
+            .font(egui::FontId::proportional(17.0))
+            .desired_width(input_rect.width())
+            .show(&mut input_ui);
+
+        if output.response.changed() {
+            self.search_changed_at = std::time::Instant::now();
+        }
+        if self.search_focus {
+            output.response.request_focus();
+            self.search_focus = false;
+        }
+
+        // ── Búsqueda con debounce de 450 ms ──────────────────────────
+        let query = self.search_query.trim().to_string();
+        if query.chars().count() < 2 {
+            if self.search_loading || !self.search_results.is_empty() {
+                self.search_results.clear();
+                self.search_error = None;
+                self.search_loading = false;
+                self.search_sent.clear();
+            }
+        } else if self.search_sent != query
+            && self.search_changed_at.elapsed() >= std::time::Duration::from_millis(450)
+        {
+            self.search_sent = query.clone();
+            self.search_loading = true;
+            self.search_error = None;
+
+            let sent = query.clone();
+            let tx = self.tx_search.clone();
+            let ctx = ui.ctx().clone();
+            self.rt.spawn(async move {
+                let result = get_source(Some("animeav1"))
+                    .search(&sent)
+                    .await
+                    .map_err(|e| e.to_string());
+                let _ = tx.send((sent, result));
+                ctx.request_repaint();
+            });
+        }
+
+        // ── Filas compartidas por sugerencias y grid ─────────────────
+        let lowered = query.to_lowercase();
+        let rows: Vec<SearchRow> = if lowered.is_empty() {
+            // Sin consulta todavía: mostramos lo último como sugerencias
+            self.items
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .map(|item| SearchRow {
+                    title: item.title.clone(),
+                    url: item.url.clone(),
+                    anime_url: item.anime_url.clone(),
+                    image: item
+                        .image
+                        .as_deref()
+                        .and_then(cover_from_thumb)
+                        .or_else(|| item.cover.clone())
+                        .or_else(|| item.image.clone()),
+                    hero: item.image.clone(),
+                })
+                .collect()
+        } else {
+            self.search_results
+                .iter()
+                .filter(|card| card.title.to_lowercase().contains(&lowered))
+                .map(|card| SearchRow {
+                    title: card.title.clone(),
+                    url: card.url.clone(),
+                    anime_url: card.anime_url.clone(),
+                    image: card.image.clone(),
+                    hero: card.image.clone(),
+                })
+                .collect()
+        };
+
+        let mut nav_target: Option<SearchRow> = None;
+
+        // ── Sugerencias (columna izquierda) ──────────────────────────
+        let mut sugg_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(suggest_rect)
+                .layout(egui::Layout::top_down(egui::Align::LEFT)),
+        );
+
+        let row_h = 38.0;
+        egui::ScrollArea::vertical()
+            .id_salt("search_suggestions")
+            .auto_shrink([false, false])
+            .show(&mut sugg_ui, |ui| {
+                if rows.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(if lowered.is_empty() {
+                            "Escribe para buscar…"
+                        } else {
+                            "Sin sugerencias"
+                        })
+                        .color(egui::Color32::from_rgb(140, 140, 155))
+                        .size(14.0),
+                    );
+                }
+
+                for row in &rows {
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(suggest_rect.width() - 12.0, row_h),
+                        egui::Sense::click(),
+                    );
+
+                    if resp.hovered() {
+                        ui.painter().rect_filled(
+                            rect,
+                            6.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                        );
+                    }
+                    if resp.clicked() {
+                        nav_target = Some(row.clone());
+                    }
+
+                    let text_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.min.x + 12.0, rect.min.y),
+                        egui::pos2(rect.max.x - 8.0, rect.max.y),
+                    );
+                    let mut text_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(text_rect)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    text_ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&row.title)
+                                .color(egui::Color32::from_rgb(210, 210, 225))
+                                .size(15.0),
+                        )
+                        .truncate(),
+                    );
+                }
+
+                ui.add_space(20.0);
+            });
+
+        // ── Grid de resultados (derecha) ─────────────────────────────
+        let card_h = (avail_height * 0.32).clamp(180.0, 300.0);
+        let card_w = card_h * 0.70;
+        let spacing = 16.0;
+        let grid_w = grid_rect.width() - 14.0; // hueco para la barra de scroll
+        let per_row = ((grid_w + spacing) / (card_w + spacing))
+            .floor()
+            .max(1.0) as usize;
+
+        if rows.is_empty() {
+            let mut empty_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(grid_rect)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            empty_ui.centered_and_justified(|ui| {
+                if self.search_loading {
+                    ui.add(egui::Spinner::new());
+                } else {
+                    ui.label(
+                        egui::RichText::new(if self.search_error.is_some() {
+                            "No se pudo completar la búsqueda"
+                        } else if lowered.is_empty() {
+                            "Escribe algo para buscar…"
+                        } else {
+                            "Sin resultados"
+                        })
+                        .color(egui::Color32::from_rgb(150, 150, 165))
+                        .size(16.0),
+                    );
+                }
+            });
+        } else {
+            let mut grid_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(grid_rect)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+
+            egui::ScrollArea::vertical()
+                .id_salt("search_grid")
+                .auto_shrink([false, false])
+                .show(&mut grid_ui, |ui| {
+                    for chunk in rows.chunks(per_row) {
+                        ui.horizontal(|ui| {
+                            for row in chunk {
+                                let (card_rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(card_w, card_h),
+                                    egui::Sense::click(),
+                                );
+
+                                if resp.clicked() {
+                                    nav_target = Some(row.clone());
+                                }
+
+                                if let Some(img) = &row.image {
+                                    egui::Image::new(img)
+                                        .fit_to_exact_size(card_rect.size())
+                                        .corner_radius(8.0)
+                                        .paint_at(ui, card_rect);
+                                } else {
+                                    ui.painter().rect_filled(
+                                        card_rect,
+                                        8.0,
+                                        egui::Color32::from_rgb(26, 26, 33),
+                                    );
+                                }
+
+                                let stroke = if resp.hovered() {
+                                    egui::Stroke::new(3.0, egui::Color32::WHITE)
+                                } else {
+                                    egui::Stroke::new(
+                                        1.5,
+                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 45),
+                                    )
+                                };
+                                ui.painter().rect_stroke(
+                                    card_rect,
+                                    8.0,
+                                    stroke,
+                                    egui::StrokeKind::Outside,
+                                );
+
+                                ui.add_space(spacing);
+                            }
+                        });
+                        ui.add_space(spacing);
+                    }
+
+                    ui.add_space(20.0);
+                });
+        }
+
+        // ── Abrir la ficha del anime elegido ─────────────────────────
+        if let Some(row) = nav_target {
+            let item = LatestItem {
+                title: row.title,
+                episode: None,
+                image: row.hero,
+                cover: row.image,
+                anime_url: row.anime_url,
+                url: row.url,
+            };
+            let ctx = ui.ctx().clone();
+            self.navigate_to_detail(&item, ctx);
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2051,6 +2457,9 @@ impl eframe::App for AniGpuApp {
             Screen::Home => {
                 self.render_main_content(&mut content_ui);
             }
+            Screen::Search => {
+                self.render_search_view(&mut content_ui);
+            }
             Screen::Detail { .. } => {
                 self.render_detail_view(&mut content_ui);
             }
@@ -2162,5 +2571,19 @@ mod tests {
         let (label, idx) = AniGpuApp::play_button_state(Some(&p), &details);
         assert_eq!(label, "▶  Continuar viendo - Capítulo FINAL");
         assert_eq!(idx, Some(0));
+    }
+
+    #[test]
+    fn portada_se_deriva_de_la_miniatura() {
+        assert_eq!(
+            cover_from_thumb("https://cdn.animeav1.com/thumbnails/4412.jpg"),
+            Some("https://cdn.animeav1.com/covers/4412.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn sin_miniatura_no_hay_portada() {
+        assert_eq!(cover_from_thumb("https://cdn.animeav1.com/covers/4412.jpg"), None);
+        assert_eq!(cover_from_thumb("https://example.test/img.jpg"), None);
     }
 }
