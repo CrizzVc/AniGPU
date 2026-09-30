@@ -151,6 +151,12 @@ struct AniGpuApp {
     detail_backdrop_requested: bool,
     /// Grupo/bloque de episodios seleccionado en la subvista de episodios
     episode_group: usize,
+
+    // Fondos desenfocados (pestañas Episodios y Relacionados)
+    blur_cache: std::collections::HashMap<String, egui::TextureHandle>,
+    blur_wanted: std::collections::HashSet<String>,
+    rx_blur: Receiver<(String, Option<egui::TextureHandle>)>,
+    tx_blur: Sender<(String, Option<egui::TextureHandle>)>,
 }
 
 impl AniGpuApp {
@@ -302,6 +308,7 @@ impl AniGpuApp {
         let (tx_tmdb, rx_tmdb) = channel();
         let (tx_detail, rx_detail) = channel();
         let (tx_search, rx_search) = channel();
+        let (tx_blur, rx_blur) = channel();
         let tmdb_cache = Self::load_tmdb_cache();
         let tmdb_requested: std::collections::HashSet<String> =
             tmdb_cache.keys().cloned().collect();
@@ -343,6 +350,11 @@ impl AniGpuApp {
             detail_backdrop_url: None,
             detail_backdrop_requested: false,
             episode_group: 0,
+
+            blur_cache: std::collections::HashMap::new(),
+            blur_wanted: std::collections::HashSet::new(),
+            rx_blur,
+            tx_blur,
         }
     }
 
@@ -1168,6 +1180,13 @@ impl AniGpuApp {
             }
         }
 
+        // Fondos desenfocados que van llegando
+        while let Ok((url, texture)) = self.rx_blur.try_recv() {
+            if let Some(texture) = texture {
+                self.blur_cache.insert(url, texture);
+            }
+        }
+
         let avail_width = ui.available_width();
         let avail_height = ui.available_height();
 
@@ -1356,7 +1375,7 @@ impl AniGpuApp {
         let full_bg_rect =
             egui::Rect::from_min_size(ui.cursor().min, egui::vec2(avail_width, avail_height));
         if let Some(url) = backdrop_url {
-            Self::paint_cover(ui, url, full_bg_rect);
+            Self::paint_cover(ui, &egui::Image::new(url), full_bg_rect);
         }
 
         // ── Strong left-side dark gradient (very pronounced) ──────
@@ -1593,7 +1612,13 @@ impl AniGpuApp {
             ui.allocate_exact_size(egui::vec2(avail_width, header_height), egui::Sense::hover());
 
         if let Some(url) = backdrop_url {
-            Self::paint_cover(ui, url, header_rect);
+            match self.blur_cache.get(url).cloned() {
+                Some(texture) => Self::paint_cover(ui, &egui::Image::new(&texture), header_rect),
+                None => {
+                    Self::paint_cover(ui, &egui::Image::new(url), header_rect);
+                    self.request_blurred_backdrop(url, ui.ctx().clone());
+                }
+            }
         }
 
         let overlay_color =
@@ -1782,9 +1807,15 @@ impl AniGpuApp {
         let (header_rect, _) =
             ui.allocate_exact_size(egui::vec2(avail_width, header_height), egui::Sense::hover());
 
-        // Draw mini backdrop (proporción original, recorte al centro)
+        // Draw mini backdrop (proporción original, recorte al centro) + desenfoque
         if let Some(url) = backdrop_url {
-            Self::paint_cover(ui, url, header_rect);
+            match self.blur_cache.get(url).cloned() {
+                Some(texture) => Self::paint_cover(ui, &egui::Image::new(&texture), header_rect),
+                None => {
+                    Self::paint_cover(ui, &egui::Image::new(url), header_rect);
+                    self.request_blurred_backdrop(url, ui.ctx().clone());
+                }
+            }
         }
 
         // Tinte suave para que el título se lea sin apagar la imagen
@@ -2564,12 +2595,14 @@ impl AniGpuApp {
 
     /// Pinta una imagen dentro de `rect` conservando su proporción
     /// (recorte tipo "cover": se llena el rectángulo y se corta por el centro).
-    fn paint_cover(ui: &mut egui::Ui, url: &str, rect: egui::Rect) {
-        let image = egui::Image::new(url);
-        let natural = image
-            .load_for_size(ui.ctx(), rect.size())
-            .ok()
-            .and_then(|poll| poll.size());
+    fn paint_cover(ui: &mut egui::Ui, image: &egui::Image<'_>, rect: egui::Rect) {
+        let natural = match image.size() {
+            Some(size) => Some(size),
+            None => image
+                .load_for_size(ui.ctx(), rect.size())
+                .ok()
+                .and_then(|poll| poll.size()),
+        };
 
         let paint_rect = match natural {
             Some(size) if size.x > 0.0 && size.y > 0.0 => {
@@ -2583,6 +2616,65 @@ impl AniGpuApp {
         ui.set_clip_rect(rect);
         image.paint_at(ui, paint_rect);
         ui.set_clip_rect(previous_clip);
+    }
+
+    /// Reduce y desenfoca los píxeles; devuelve la imagen lista para la textura.
+    fn blur_rgba(rgba: &image::RgbaImage) -> Option<egui::ColorImage> {
+        let (w, h) = (rgba.width(), rgba.height());
+        if w == 0 || h == 0 {
+            return None;
+        }
+
+        // Lo bastante pequeña para que al ampliarla quede suave
+        let small_w = 240u32;
+        let small_h = ((u64::from(small_w) * u64::from(h)) / u64::from(w)).max(1) as u32;
+        let small = image::imageops::resize(
+            rgba,
+            small_w,
+            small_h,
+            image::imageops::FilterType::Triangle,
+        );
+        let blurred = image::imageops::blur(&small, 3.0);
+
+        Some(egui::ColorImage::from_rgba_unmultiplied(
+            [small_w as usize, small_h as usize],
+            blurred.as_raw(),
+        ))
+    }
+
+    /// Descarga la imagen, la reduce y la desenfoca para usarla de fondo.
+    async fn load_blurred(url: &str, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        let bytes = anigpu_core::http::client()
+            .get(url)
+            .header(reqwest::header::USER_AGENT, anigpu_core::http::DEFAULT_UA)
+            .send()
+            .await
+            .ok()?
+            .bytes()
+            .await
+            .ok()?;
+        let rgba = image::load_from_memory(&bytes).ok()?.into_rgba8();
+        let color = Self::blur_rgba(&rgba)?;
+
+        Some(ctx.load_texture(
+            format!("blur:{url}"),
+            color,
+            egui::TextureOptions::LINEAR,
+        ))
+    }
+
+    /// Pide (una sola vez) el fondo desenfocado de esta URL.
+    fn request_blurred_backdrop(&mut self, url: &str, ctx: egui::Context) {
+        if !self.blur_wanted.insert(url.to_owned()) {
+            return;
+        }
+        let url = url.to_owned();
+        let tx = self.tx_blur.clone();
+        self.rt.spawn(async move {
+            let texture = Self::load_blurred(&url, &ctx).await;
+            let _ = tx.send((url, texture));
+            ctx.request_repaint();
+        });
     }
 
     fn draw_gradient_rect(
@@ -2791,5 +2883,25 @@ mod tests {
     fn sin_miniatura_no_hay_portada() {
         assert_eq!(cover_from_thumb("https://cdn.animeav1.com/covers/4412.jpg"), None);
         assert_eq!(cover_from_thumb("https://example.test/img.jpg"), None);
+    }
+
+    #[test]
+    fn el_desenfoque_suaviza_los_bordes() {
+        let mut img = image::RgbaImage::from_pixel(480, 360, image::Rgba([0, 0, 0, 255]));
+        for x in 0..240 {
+            for y in 0..360 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+
+        let out = AniGpuApp::blur_rgba(&img).expect("debería generar la imagen");
+        assert_eq!(out.size, [240, 180]);
+
+        let edge = out.pixels[90 * 240 + 120].r();
+        assert!(
+            (10..245).contains(&edge),
+            "el borde no quedó suavizado: {}",
+            edge
+        );
     }
 }
