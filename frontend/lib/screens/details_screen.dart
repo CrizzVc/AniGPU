@@ -2,8 +2,8 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
 import '../models/models.dart';
+import '../playback/play_flow.dart';
 import '../state/app_state.dart';
-import 'player_screen.dart';
 
 class DetailsScreen extends StatefulWidget {
   const DetailsScreen({
@@ -58,73 +58,13 @@ class _DetailsScreenState extends State<DetailsScreen> {
     }
   }
 
-  Future<void> _playEpisode(EpisodeItem episode) async {
-    showDialog<void>(
+  Future<void> _playEpisode(EpisodeItem episode) {
+    return playEpisodeUrl(
       context: context,
-      barrierDismissible: false,
-      builder: (_) => const Center(child: CircularProgressIndicator()),
+      state: widget.state,
+      episodeUrl: episode.url,
+      title: '${_details?.title ?? widget.title} — Ep. ${episode.episode}',
     );
-    try {
-      final servers = await widget.state.api.servers(
-        source: widget.state.sourceId,
-        url: episode.url,
-      );
-      if (!mounted) return;
-      Navigator.of(context).pop();
-      if (servers.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No hay servidores para este episodio.')),
-        );
-        return;
-      }
-      final chosen = await showModalBottomSheet<ServerItem>(
-        context: context,
-        showDragHandle: true,
-        builder: (context) {
-          return ListView(
-            children: [
-              const ListTile(title: Text('Elegí un servidor')),
-              for (final server in servers)
-                ListTile(
-                  title: Text(server.title),
-                  subtitle: server.server != null ? Text(server.server!) : null,
-                  onTap: () => Navigator.pop(context, server),
-                ),
-            ],
-          );
-        },
-      );
-      if (chosen == null || !mounted) return;
-      final embed = chosen.embedUrl;
-      if (embed == null || embed.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('El servidor no tiene URL de embed.')),
-        );
-        return;
-      }
-
-      showDialog<void>(
-        context: context,
-        barrierDismissible: false,
-        builder: (_) => const Center(child: CircularProgressIndicator()),
-      );
-      final extraction = await widget.state.api.extract(url: embed);
-      if (!mounted) return;
-      Navigator.of(context).pop();
-
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => PlayerScreen(
-            title: '${_details?.title ?? widget.title} — Ep. ${episode.episode}',
-            extraction: extraction,
-          ),
-        ),
-      );
-    } on ApiException catch (e) {
-      if (!mounted) return;
-      Navigator.of(context).pop();
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.message)));
-    }
   }
 
   @override

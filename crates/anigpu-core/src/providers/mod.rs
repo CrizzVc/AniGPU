@@ -3,6 +3,7 @@ pub mod maru;
 pub mod mp4upload;
 pub mod streamwish;
 pub mod yourupload;
+pub mod tmdb;
 
 use async_trait::async_trait;
 

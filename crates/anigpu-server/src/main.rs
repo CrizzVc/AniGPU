@@ -5,7 +5,7 @@ use anigpu_core::{
 use axum::{
     extract::Query,
     http::{HeaderMap, StatusCode},
-    response::Json,
+    response::{IntoResponse, Response, Json},
     routing::get,
     Router,
 };
@@ -65,8 +65,56 @@ fn get_source(query: &Option<String>, headers: &HeaderMap) -> &'static dyn Sourc
     sources::get_source(source_id)
 }
 
+async fn proxy_image(
+    Query(url_query): Query<UrlQuery>,
+) -> Response {
+    let url = url_query.url;
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .unwrap();
+
+    let mut request = client.get(&url);
+    request = request
+        .header("Referer", "https://animeav1.com/")
+        .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+        .header("Accept-Language", "es-ES,es;q=0.9,en;q=0.8")
+        .header("Connection", "keep-alive");
+
+    match request.send().await {
+        Ok(res) => {
+            let status = res.status();
+            let content_type = res
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("image/jpeg")
+                .to_string();
+
+            let bytes = match res.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("Failed to read image bytes: {}", e);
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+
+            Response::builder()
+                .status(status)
+                .header("content-type", content_type)
+                .body(axum::body::Body::from(bytes))
+                .unwrap()
+        }
+        Err(e) => {
+            tracing::error!("Proxy image error: {}", e);
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
 // Helper for error responses
 fn internal_error(e: anigpu_core::Error, msg: &str) -> (StatusCode, Json<ErrorResponse>) {
+
     tracing::error!("{}: {}", msg, e);
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -191,7 +239,9 @@ async fn main() {
         .route("/api/browse", get(browse))
         .route("/api/extract", get(extract))
         .route("/api/sources", get(list_sources))
+        .route("/api/image", get(proxy_image))
         .layer(CorsLayer::permissive());
+
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let addr = format!("0.0.0.0:{}", port).parse::<SocketAddr>().unwrap();

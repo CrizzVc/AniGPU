@@ -1,12 +1,13 @@
 import 'package:flutter/material.dart';
 
+import 'util/http_client.dart';
 import 'screens/browse_screen.dart';
 import 'screens/home_screen.dart';
 import 'screens/search_screen.dart';
 import 'state/app_state.dart';
-import 'widgets/source_selector.dart';
 
 void main() {
+  setupHttpOverrides();
   runApp(const AniGpuApp());
 }
 
@@ -77,34 +78,66 @@ class _ShellState extends State<Shell> {
     ];
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('AniGPU'),
-        actions: [
-          Padding(
-            padding: const EdgeInsets.only(right: 16),
-            child: SourceSelector(state: widget.state),
+      body: Row(
+        children: [
+          NavigationRail(
+            backgroundColor: const Color(0xFF0A0A0E),
+            selectedIndex: _index,
+            onDestinationSelected: (i) => setState(() => _index = i),
+            labelType: NavigationRailLabelType.none,
+            leading: Padding(
+              padding: const EdgeInsets.only(bottom: 12, top: 8),
+              child: PopupMenuButton<String>(
+                tooltip: 'Fuente',
+                initialValue: widget.state.sourceId,
+                onSelected: widget.state.setSource,
+                itemBuilder: (context) => [
+                  for (final source in widget.state.sources)
+                    PopupMenuItem(
+                      value: source.id,
+                      child: Text(source.name),
+                    ),
+                ],
+                child: const CircleAvatar(
+                  radius: 16,
+                  backgroundColor: Color(0xFF1C1C24),
+                  child: Icon(Icons.public, size: 18),
+                ),
+              ),
+            ),
+            trailing: Expanded(
+              child: Align(
+                alignment: Alignment.bottomCenter,
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 16),
+                  child: Icon(
+                    Icons.person_outline,
+                    color: Colors.white.withValues(alpha: 0.55),
+                  ),
+                ),
+              ),
+            ),
+            destinations: const [
+              NavigationRailDestination(
+                icon: Icon(Icons.home_outlined),
+                selectedIcon: Icon(Icons.home),
+                label: Text('Inicio'),
+              ),
+              NavigationRailDestination(
+                icon: Icon(Icons.grid_view_outlined),
+                selectedIcon: Icon(Icons.grid_view),
+                label: Text('Catálogo'),
+              ),
+              NavigationRailDestination(
+                icon: Icon(Icons.search_outlined),
+                selectedIcon: Icon(Icons.search),
+                label: Text('Buscar'),
+              ),
+            ],
           ),
-        ],
-      ),
-      body: IndexedStack(index: _index, children: pages),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _index,
-        onDestinationSelected: (i) => setState(() => _index = i),
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.home_outlined),
-            selectedIcon: Icon(Icons.home),
-            label: 'Inicio',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.grid_view_outlined),
-            selectedIcon: Icon(Icons.grid_view),
-            label: 'Catálogo',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.search_outlined),
-            selectedIcon: Icon(Icons.search),
-            label: 'Buscar',
+          const VerticalDivider(width: 1, color: Color(0xFF1C1C24)),
+          Expanded(
+            child: IndexedStack(index: _index, children: pages),
           ),
         ],
       ),
